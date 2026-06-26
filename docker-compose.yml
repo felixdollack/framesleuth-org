@@ -1,0 +1,97 @@
+version: "3.8"
+
+services:
+  llama-vlm:
+    image: ghcr.io/ggml-org/llama.cpp:latest
+    container_name: framesleuth-vlm
+    profiles:
+      - local-default
+      - local-onestack
+      - server
+    command: |
+      llama-server
+      -hf Qwen/Qwen3-VL-8B-Instruct-GGUF
+      --mmproj ~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct-GGUF/snapshots/*/qwen3-vl-mmproj.gguf
+      --n-gpu-layers 99
+      -c 32768
+      --parallel 2
+      --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    restart: unless-stopped
+
+  ollama-coder:
+    image: ollama/ollama:latest
+    container_name: framesleuth-coder
+    profiles:
+      - local-default
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_NUM_PARALLEL=2
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  llama-coder:
+    image: ghcr.io/ggml-org/llama.cpp:latest
+    container_name: framesleuth-coder-llama
+    profiles:
+      - local-onestack
+    command: |
+      llama-server
+      -hf Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+      -c 16384
+      --parallel 2
+      --port 8081
+    ports:
+      - "8081:8081"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    restart: unless-stopped
+
+  framesleuth-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: framesleuth-backend
+    ports:
+      - "8010:8000"
+    environment:
+      - ENGINE_PROFILE=local-default
+      - VLM_URL=http://llama-vlm:8080
+      - CODER_URL=http://ollama-coder:11434
+      - LOG_LEVEL=INFO
+      - BACKEND_HOST=0.0.0.0
+    volumes:
+      - ./bug-reports:/app/bug-reports
+      - ~/.cache/whisper:/root/.cache/whisper
+    depends_on:
+      - llama-vlm
+    restart: unless-stopped
+
+  framesleuth-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CMD: mcp
+    container_name: framesleuth-mcp
+    environment:
+      - LOG_LEVEL=INFO
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./bug-reports:/app/bug-reports
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+    driver: local

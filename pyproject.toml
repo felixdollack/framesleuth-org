@@ -1,0 +1,173 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "framesleuth"
+version = "0.1.0"
+description = "Local bug-reproduction video analysis exposed over MCP (VS Code and any MCP client)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Framesleuth Contributors"}
+]
+
+dependencies = [
+    # Core framework
+    "fastapi>=0.111,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "python-multipart>=0.0.9,<0.1.0",
+    "pydantic>=2.8.0,<3.0.0",
+    "pydantic-settings>=2.5,<3.0",
+
+    # Video/audio processing (PyAV bundles ffmpeg; no system binary required).
+    # opencv must be a NumPy 2.x-compatible build (4.10+).
+    "av>=17.1.0,<18.0.0",
+    "opencv-python>=4.10,<5.0",
+    "faster-whisper>=1.2,<2.0",
+
+    # HTTP client for the OpenAI-compatible VLM/coder servers
+    "aiohttp>=3.9,<4.0",
+
+    # MCP (FastMCP lives at mcp.server.fastmcp in 1.12+)
+    "mcp>=1.12,<2.0",
+
+    # Storage/jobs
+    "aiosqlite>=0.19,<0.21",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.4.3",
+    "pytest-asyncio==0.21.1",
+    "pytest-cov==4.1.0",
+    "pytest-mock==3.12.0",
+    "mypy==1.7.0",
+    "ruff==0.1.8",
+    "black==23.12.0",
+    "isort==5.13.2",
+    "pre-commit==3.5.0",
+    "httpx>=0.27,<0.29",
+]
+
+[project.scripts]
+framesleuth-api = "framesleuth.service.api:main"
+framesleuth-mcp = "framesleuth.mcp_server.videobug_mcp:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["framesleuth"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
+check_untyped_defs = true
+disallow_untyped_calls = true
+
+[[tool.mypy.overrides]]
+module = [
+    "cv2.*",
+    "av.*",
+    "numpy.*",
+    "mcp.*",
+    "aiosqlite.*",
+    "faster_whisper.*",
+]
+ignore_missing_imports = true
+# Treat these as untyped integration boundaries even when they ship (often
+# imperfect) stubs, so strict checks don't trip on their generics/ndarray types.
+follow_imports = "skip"
+
+# The FastMCP server registers tools via the (optional, untyped) mcp SDK
+# decorators; those are an integration boundary that can't be strictly typed.
+[[tool.mypy.overrides]]
+module = ["framesleuth.mcp_server.videobug_mcp"]
+disallow_untyped_decorators = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "C",      # flake8-comprehensions
+    "B",      # flake8-bugbear
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+    "RUF",    # Ruff-specific rules
+    "D",      # pydocstyle
+]
+ignore = [
+    "D100",   # Missing module docstring
+    "D101",   # Missing class docstring
+    "D102",   # Missing method docstring
+    "D103",   # Missing function docstring
+    "D104",   # Missing package docstring
+    "D105",   # Missing magic method docstring
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "ARG", "SIM", "B008"]
+"framesleuth/scripts/*" = ["D"]
+# FastAPI relies on callables (File/Form/Depends) as argument defaults by design.
+"framesleuth/service/api.py" = ["B008"]
+"scripts/*" = ["D", "B008"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+known_first_party = ["framesleuth"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--strict-markers --cov=framesleuth --cov-report=term-missing:skip-covered --cov-fail-under=70"
+markers = [
+    "unit: fast unit tests (no IO)",
+    "integration: slower integration tests (requires services)",
+    "e2e: end-to-end tests (requires full system)",
+    "slow: tests taking > 1 second",
+]
+
+[tool.coverage.run]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/conftest.py",
+    "framesleuth/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*Protocol.*:",
+    "^\\s*@(abc\\.)?abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"

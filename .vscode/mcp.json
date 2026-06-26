@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "videobug": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/bin/framesleuth-mcp",
+      "args": [],
+      "env": {
+        "BUNDLE_DIR": "${workspaceFolder}/bug-reports",
+        "DATABASE_PATH": "${workspaceFolder}/bug-reports/jobs.db"
+      }
+    }
+  }
+}

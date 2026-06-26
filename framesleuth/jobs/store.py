@@ -1,0 +1,158 @@
+"""SQLite-backed job store with idempotency key support."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import aiosqlite
+
+from framesleuth.schemas import JobState
+
+
+@dataclass
+class StoredJob:
+    """In-memory view of persisted job."""
+
+    id: str
+    state: JobState
+    progress_pct: int
+    content_hash: str
+    source_video: str
+    bundle_path: str | None
+    error_json: dict[str, str] | None
+    created_at: str
+    updated_at: str
+
+
+class JobStore:
+    """Transactional job store with state updates and idempotency lookups."""
+
+    def __init__(self, db_path: Path) -> None:
+        """Initialize the store backed by the SQLite database at ``db_path``."""
+        self.db_path = db_path
+
+    async def initialize(self) -> None:
+        """Initialize schema if needed."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    progress_pct INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    source_video TEXT NOT NULL,
+                    bundle_path TEXT,
+                    error_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_content_hash ON jobs(content_hash)"
+            )
+            await conn.commit()
+
+    async def create_job(self, job_id: str, content_hash: str, source_video: str) -> None:
+        """Create a queued job record."""
+        now = datetime.now(UTC).isoformat()
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                """
+                INSERT INTO jobs(
+                    id, state, progress_pct, content_hash, source_video,
+                    bundle_path, error_json, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    JobState.QUEUED.value,
+                    0,
+                    content_hash,
+                    source_video,
+                    None,
+                    None,
+                    now,
+                    now,
+                ),
+            )
+            await conn.commit()
+
+    async def find_by_content_hash(self, content_hash: str) -> StoredJob | None:
+        """Find existing job by content hash for idempotency."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT * FROM jobs WHERE content_hash = ? ORDER BY created_at DESC LIMIT 1",
+                (content_hash,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return _row_to_job(row)
+
+    async def get_job(self, job_id: str) -> StoredJob | None:
+        """Fetch job by id."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)) as cursor:
+                row = await cursor.fetchone()
+        return _row_to_job(row)
+
+    async def update_job(
+        self,
+        job_id: str,
+        *,
+        state: JobState | None = None,
+        progress_pct: int | None = None,
+        bundle_path: str | None = None,
+        error_json: dict[str, str] | None = None,
+    ) -> None:
+        """Update selected mutable fields for a job."""
+        updates: list[str] = []
+        values: list[Any] = []
+
+        if state is not None:
+            updates.append("state = ?")
+            values.append(state.value)
+        if progress_pct is not None:
+            updates.append("progress_pct = ?")
+            values.append(progress_pct)
+        if bundle_path is not None:
+            updates.append("bundle_path = ?")
+            values.append(bundle_path)
+        if error_json is not None:
+            updates.append("error_json = ?")
+            values.append(json.dumps(error_json))
+
+        updates.append("updated_at = ?")
+        values.append(datetime.now(UTC).isoformat())
+        values.append(job_id)
+
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                f"UPDATE jobs SET {', '.join(updates)} WHERE id = ?",
+                tuple(values),
+            )
+            await conn.commit()
+
+
+def _row_to_job(row: Any) -> StoredJob | None:
+    if row is None:
+        return None
+    return StoredJob(
+        id=row["id"],
+        state=JobState(row["state"]),
+        progress_pct=int(row["progress_pct"]),
+        content_hash=row["content_hash"],
+        source_video=row["source_video"],
+        bundle_path=row["bundle_path"],
+        error_json=json.loads(row["error_json"]) if row["error_json"] else None,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
