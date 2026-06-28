@@ -1,6 +1,6 @@
 # Use Framesleuth from VS Code Copilot & Claude (MCP)
 
-Framesleuth ships an MCP server (`framesleuth-mcp`, server name **`videobug`**)
+Framesleuth ships an MCP server (`framesleuth-mcp`, server name **`framesleuth`**)
 that lets an AI agent analyze a bug video and act on the result — all over the
 Model Context Protocol. This page is the **client setup reference** for the three
 common agents:
@@ -15,7 +15,7 @@ common agents:
 
 ---
 
-## What the `videobug` server exposes
+## What the `framesleuth` server exposes
 
 Everything is **read-only** over the workspace and the bundle directory — the
 server never edits files. Edits happen through the editor/agent's own reviewed
@@ -26,8 +26,8 @@ apply flow.
 | tool | `analyze_video(path, repo_root?, intent?, skill?, system_prompt?, action?, action_prompt?)` | Run the full pipeline on a local video; returns the report `id`, the resolved `action`, the `suggested_actions` menu, and `summary_resource`/`fix_prompt_resource` URIs. Pass `repo_root` to ground errors to code, `intent` to steer the work, `skill` for a summary style, and `action` (or `action_prompt`) to shape what the agent should do (see §A). |
 | tool | `list_skills()` | List built-in summary skills (names + descriptions) |
 | tool | `list_actions()` | List built-in **action modes** (`fix`, `explain`, `triage`, `test`, `report`, `reproduce`) |
-| tool | `list_bug_reports()` | List available report ids |
-| tool | `get_bug_report(report_id, view?)` | The Bug Context Bundle. `view="slim"` returns the action-relevant subset for small context windows; `view="full"` (default) returns everything. |
+| tool | `list_reports()` | List available report ids |
+| tool | `get_report(report_id, view?)` | The Context Bundle. `view="slim"` returns the action-relevant subset for small context windows; `view="full"` (default) returns everything. |
 | tool | `get_suggested_actions(report_id)` | Machine-readable next-step menu (`action`/`label`/`rationale`/`ref`) |
 | tool | `get_repro_steps(report_id)` | Numbered, cited reproduction steps |
 | tool | `get_error_evidence(report_id)` | Timestamped console/OCR/network errors |
@@ -36,10 +36,10 @@ apply flow.
 | tool | `get_video_gif(report_id, fps?, width?, start?, end?)` | An animated GIF preview of the recording (cached on disk) |
 | tool | `locate_in_code(report_id, repo_root?)` | Ranked candidate files/lines in the repo |
 | tool | `render(report_id, format)` | Render the report as `markdown`, `issue` (GitHub issue text), or `test-plan` |
-| resource | `videobug://report/{id}/summary` | Concise human summary + `suggested_actions` |
-| resource | `videobug://report/{id}/fix-prompt` | Intent- and **action**-aware, evidence-only action prompt |
-| resource | `videobug://report/{id}/markdown` | Shareable markdown report |
-| resource | `videobug://report/{id}/issue` | GitHub-issue text (title + labels + body) |
+| resource | `framesleuth://report/{id}/summary` | Concise human summary + `suggested_actions` |
+| resource | `framesleuth://report/{id}/fix-prompt` | Intent- and **action**-aware, evidence-only action prompt |
+| resource | `framesleuth://report/{id}/markdown` | Shareable markdown report |
+| resource | `framesleuth://report/{id}/issue` | GitHub-issue text (title + labels + body) |
 | prompt | `fix_from_video(report_id)` | Same action prompt, as an MCP prompt |
 
 The `fix-prompt` leads with an **Analysis confidence** block derived from
@@ -87,10 +87,21 @@ Two environment variables point the server at the report store (the **same**
 - `BUNDLE_DIR` → e.g. `<repo>/bug-reports`
 - `DATABASE_PATH` → e.g. `<repo>/bug-reports/jobs.db`
 
-> **Absolute paths:** config files do **not** expand `~` or `${workspaceFolder}`
-> (except VS Code's `mcp.json`, which expands `${workspaceFolder}`). Everywhere
-> else use the real absolute path, e.g.
-> `/Users/you/workspace/framesleuth/.venv/bin/framesleuth-mcp`.
+> **Absolute paths (important):** MCP configs do **not** expand `~` or
+> `${workspaceFolder}` — *except* VS Code's **workspace** `mcp.json`. A
+> `${workspaceFolder}` command added at **user/global** scope (or in Cursor /
+> Claude Desktop / Claude Code) is passed through literally and fails with
+> `spawn ${workspaceFolder}/.venv/bin/framesleuth-mcp ENOENT`. Use an absolute
+> path everywhere else. To get a guaranteed-correct, copy-pasteable config for
+> any client, run (in the activated venv):
+>
+> ```bash
+> framesleuth-mcp --print-config
+> ```
+>
+> It resolves the absolute path to `framesleuth-mcp` and prints the right config
+> for Claude Desktop / Cursor (`mcpServers`), VS Code (`servers`), and the
+> `claude mcp add` CLI.
 
 ### Smoke-test the server before wiring a client
 
@@ -101,7 +112,7 @@ is wrong":
 ```bash
 python - <<'PY'
 import asyncio
-from framesleuth.mcp_server.videobug_mcp import build_server
+from framesleuth.mcp_server.server import build_server
 
 async def main():
     s = build_server()
@@ -114,7 +125,7 @@ PY
 ```
 
 Expected: 14 tools (`analyze_video`, `list_skills`, `list_actions`,
-`list_bug_reports`, `get_bug_report`, `get_suggested_actions`, `get_repro_steps`,
+`list_reports`, `get_report`, `get_suggested_actions`, `get_repro_steps`,
 `get_error_evidence`, `get_timeline`, `get_keyframe_image`, `get_video_gif`,
 `locate_in_code`, `render`, `render_html_video`), 4 resources, and the
 `fix_from_video` prompt.
@@ -127,12 +138,17 @@ a client and produces no output — Ctrl-C to exit; that silence is success).
 ## 1. VS Code + GitHub Copilot
 
 Top-level key is **`servers`** (VS Code-specific — differs from Claude). This repo
-already ships [`.vscode/mcp.json`](../.vscode/mcp.json) using `${workspaceFolder}`:
+already ships [`.vscode/mcp.json`](../.vscode/mcp.json) using `${workspaceFolder}`.
+
+> ⚠️ `${workspaceFolder}` only resolves when this config is **workspace-scoped**
+> and the **framesleuth repo is the open folder**. If you add `framesleuth` at
+> **user/global** scope you'll get `spawn ${workspaceFolder}/... ENOENT` — use an
+> absolute-path config from `framesleuth-mcp --print-config` instead.
 
 ```jsonc
 {
   "servers": {
-    "videobug": {
+    "framesleuth": {
       "type": "stdio",
       "command": "${workspaceFolder}/.venv/bin/framesleuth-mcp",
       "args": [],
@@ -146,8 +162,8 @@ already ships [`.vscode/mcp.json`](../.vscode/mcp.json) using `${workspaceFolder
 ```
 
 1. `code .` from the repo root.
-2. Open `.vscode/mcp.json` → click the **Start** code lens above `videobug`
-   (or **MCP: List Servers** → start `videobug`).
+2. Open `.vscode/mcp.json` → click the **Start** code lens above `framesleuth`
+   (or **MCP: List Servers** → start `framesleuth`).
 3. Open **Copilot Chat → Agent mode** (tools are invisible in Ask mode).
 
 > Windows: `${workspaceFolder}\\.venv\\Scripts\\framesleuth-mcp.exe`.
@@ -162,7 +178,7 @@ already ships [`.vscode/mcp.json`](../.vscode/mcp.json) using `${workspaceFolder
 command Claude Code runs:
 
 ```bash
-claude mcp add videobug \
+claude mcp add framesleuth \
   -s project \
   -e BUNDLE_DIR=/Users/you/workspace/framesleuth/bug-reports \
   -e DATABASE_PATH=/Users/you/workspace/framesleuth/bug-reports/jobs.db \
@@ -175,7 +191,7 @@ via a checked-in `.mcp.json`), `-s user` (all your projects).
 Verify and use:
 
 ```bash
-claude mcp list           # videobug should be listed
+claude mcp list           # framesleuth should be listed
 claude                    # then ask it to analyze a video (see §4)
 ```
 
@@ -186,7 +202,7 @@ For a team, commit a `.mcp.json` in the repo root. Top-level key is **`mcpServer
 ```json
 {
   "mcpServers": {
-    "videobug": {
+    "framesleuth": {
       "type": "stdio",
       "command": "/Users/you/workspace/framesleuth/.venv/bin/framesleuth-mcp",
       "env": {
@@ -215,7 +231,7 @@ Top-level key is **`mcpServers`**; stdio is the default (no `type` needed):
 ```json
 {
   "mcpServers": {
-    "videobug": {
+    "framesleuth": {
       "command": "/Users/you/workspace/framesleuth/.venv/bin/framesleuth-mcp",
       "args": [],
       "env": {
@@ -227,7 +243,7 @@ Top-level key is **`mcpServers`**; stdio is the default (no `type` needed):
 }
 ```
 
-After restart, the `videobug` tools appear under the tools/🔌 menu.
+After restart, the `framesleuth` tools appear under the tools/🔌 menu.
 
 ---
 
@@ -277,10 +293,10 @@ A concrete pass you can run top-to-bottom to confirm Copilot can analyze a video
 2. **Install + smoke-test the server** (see §0). `which framesleuth-mcp` resolves
    and the smoke test prints 14 tools.
 3. **Start the server in VS Code.** `code .`, open `.vscode/mcp.json`, click
-   **Start** above `videobug` (or **MCP: List Servers → Start**). The code lens
+   **Start** above `framesleuth` (or **MCP: List Servers → Start**). The code lens
    should flip to **Running**.
 4. **Analyze + act, in Copilot Chat → Agent mode:**
-   > Use the videobug tools. Call `analyze_video` with
+   > Use the framesleuth tools. Call `analyze_video` with
    > `path="samples/flash_bug.mp4"`, `repo_root` set to this workspace, and
    > `intent="find why the Save button hangs and propose a fix"`. Then read the
    > report's summary, repro steps, error evidence, and fix-prompt, and propose a

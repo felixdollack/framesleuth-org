@@ -1,4 +1,4 @@
-"""videobug MCP server and read-only report helpers (VS Code / Surface A).
+"""framesleuth MCP server and read-only report helpers (VS Code / Surface A).
 
 The pure helper functions hold the logic (and are unit-tested without the MCP
 SDK). ``build_server`` wires them into a `FastMCP` server exposing tools,
@@ -35,6 +35,7 @@ _FIX_PROMPT_FIELDS = {
     "keyframe_refs",
     "user_intent",
     "analysis_quality",
+    "build_context",
     "classification",
     "action",
     "action_prompt",
@@ -58,6 +59,8 @@ _SLIM_FIELDS = {
     "repro_steps",
     "error_evidence",
     "code_candidates",
+    "build_context",
+    "field_confidence",
     "user_intent",
 }
 
@@ -112,7 +115,7 @@ def build_fix_prompt_input(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def render_fix_prompt(report: dict[str, Any]) -> str:
-    """Render the grounded fix prompt from a bug bundle (evidence-only).
+    """Render the grounded action prompt from a context bundle (evidence-only).
 
     The task block is resolved from the report's stored ``action`` (or custom
     ``action_prompt``), falling back to an auto-pick from the classification so
@@ -127,7 +130,7 @@ def render_fix_prompt(report: dict[str, Any]) -> str:
     label = (data.get("classification") or {}).get("label")
     task = resolve_action_task(data.get("action"), data.get("action_prompt"), label)
     return FixPrompts.fix_from_video(
-        title=data.get("title", "Unknown bug"),
+        title=data.get("title", "Untitled"),
         severity=data.get("severity", "unknown"),
         component=data.get("suspected_component", "unknown"),
         environment=data.get("environment", {}),
@@ -139,12 +142,13 @@ def render_fix_prompt(report: dict[str, Any]) -> str:
         keyframe_path=keyframe_path,
         user_request=data.get("user_intent"),
         quality=data.get("analysis_quality"),
+        build_context=data.get("build_context"),
         task=task,
     )
 
 
 def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
-    """Construct the read-only ``videobug`` FastMCP server.
+    """Construct the read-only ``framesleuth`` FastMCP server.
 
     Args:
         bundle_root: Directory holding ``{id}/bundle.json`` reports. Defaults to
@@ -165,7 +169,7 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
 
     settings = get_settings()
     root = bundle_root or settings.BUNDLE_DIR
-    mcp = FastMCP("videobug")
+    mcp = FastMCP("framesleuth")
 
     # One store for the server's lifetime; schema is created on first use rather
     # than rebuilt on every analyze_video call.
@@ -188,15 +192,21 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
         action: str | None = None,
         action_prompt: str | None = None,
     ) -> dict[str, Any]:
-        """Analyze a screen-recording video and return the new report id.
+        """Analyze any video and return the new report id.
+
+        Works on any kind of video — a bug recording, a feature demo, a design
+        walkthrough, a Loom, a phone capture — and distills it into a structured
+        Context Bundle a coding agent can act on (fix a bug, add or change a
+        feature, or build something new).
 
         Args:
             path: Path to the video file (.mp4/.webm/.mkv/.mov/.avi).
-            repo_root: Repo to ground error text against (pass the open workspace).
+            repo_root: Repo to ground references against (pass the open workspace).
             intent: The user's request to act on, e.g. "fix the save button that
-                hangs" or "add a dark-mode toggle like the demo shows". It is
-                recorded on the report and shapes the generated fix prompt so the
-                calling agent does what the user actually asked.
+                hangs", "add a dark-mode toggle like the demo shows", or "build
+                this onboarding screen from the walkthrough". It is recorded on the
+                report and shapes the generated action prompt so the calling agent
+                does what the user actually asked.
             skill: Built-in summary style — one of the names from ``list_skills``
                 (e.g. "summary", "bug_report", "tutorial", "action_items").
                 Defaults to "summary".
@@ -240,8 +250,8 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
             "id": job_id,
             "action": report.get("action"),
             "suggested_actions": report.get("suggested_actions", []),
-            "summary_resource": f"videobug://report/{job_id}/summary",
-            "fix_prompt_resource": f"videobug://report/{job_id}/fix-prompt",
+            "summary_resource": f"framesleuth://report/{job_id}/summary",
+            "fix_prompt_resource": f"framesleuth://report/{job_id}/fix-prompt",
         }
 
     @mcp.tool()
@@ -283,14 +293,14 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
 
         return _render(get_report(root, report_id), format)
 
-    @mcp.tool()
-    def list_bug_reports() -> list[str]:
-        """List all available bug report ids."""
+    @mcp.tool(name="list_reports")
+    def list_reports_tool() -> list[str]:
+        """List all available report ids (from any analyzed video)."""
         return list_reports(root)
 
-    @mcp.tool()
-    def get_bug_report(report_id: str, view: str = "full") -> dict[str, Any]:
-        """Return the Bug Context Bundle for a report id.
+    @mcp.tool(name="get_report")
+    def get_report_tool(report_id: str, view: str = "full") -> dict[str, Any]:
+        """Return the Context Bundle for a report id.
 
         ``view="full"`` (default) returns everything; ``view="slim"`` returns the
         action-relevant subset (classification, quality, steps, evidence,
@@ -337,10 +347,10 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
         start: float = 0.0,
         end: float | None = None,
     ) -> Image:
-        """Render an animated GIF preview of the recording for a report.
+        """Render an animated GIF preview of the video for a report.
 
-        Useful for embedding a short looping preview of the bug in an issue, chat,
-        or PR description. ``fps``/``width``/``start``/``end`` are optional and
+        Useful for embedding a short looping preview in an issue, chat, or PR
+        description. ``fps``/``width``/``start``/``end`` are optional and
         clamped to safe ranges; the GIF is cached on disk per parameter set.
         """
         from framesleuth.pipeline.gif import encode_gif, normalize_options
@@ -389,9 +399,11 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
         """Render an HTML document (CSS / JS / canvas animation) to mp4/gif/webm.
 
         Use this to export a self-contained animated HTML page (e.g. one you just
-        designed) as a shareable clip. Returns the absolute path to the encoded
-        file, written under the bundle directory. Requires the optional
-        ``render`` extra (Playwright) plus ``ffmpeg``.
+        designed) as a shareable clip. Captures the animation **frame-by-frame**
+        (full color, no dropped frames, no quality loss) and encodes a
+        color-correct H.264 MP4 / VP9 WebM / palette GIF — up to 4K, 5-60 fps.
+        Returns the absolute path to the encoded file, written under the bundle
+        directory. Requires the optional ``render`` extra (Playwright) + ``ffmpeg``.
         """
         from framesleuth.pipeline.html_render import RenderOptions, render_html
 
@@ -402,7 +414,7 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
         path = await render_html(html, options, out_dir)
         return str(path)
 
-    @mcp.resource("videobug://report/{report_id}/summary")
+    @mcp.resource("framesleuth://report/{report_id}/summary")
     def report_summary(report_id: str) -> str:
         """Concise human-readable summary of a report, with the next-step menu."""
         report = get_report(root, report_id)
@@ -423,19 +435,19 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
             indent=2,
         )
 
-    @mcp.resource("videobug://report/{report_id}/fix-prompt")
+    @mcp.resource("framesleuth://report/{report_id}/fix-prompt")
     def report_fix_prompt(report_id: str) -> str:
         """Rendered, evidence-only fix prompt for a report (shaped by its action)."""
         return render_fix_prompt(get_report(root, report_id))
 
-    @mcp.resource("videobug://report/{report_id}/markdown")
+    @mcp.resource("framesleuth://report/{report_id}/markdown")
     def report_markdown(report_id: str) -> str:
         """Shareable markdown report rendered from the bundle."""
         from framesleuth.render import render_markdown
 
         return render_markdown(get_report(root, report_id))
 
-    @mcp.resource("videobug://report/{report_id}/issue")
+    @mcp.resource("framesleuth://report/{report_id}/issue")
     def report_issue(report_id: str) -> str:
         """GitHub-issue text (title + labels + body) rendered from the bundle."""
         from framesleuth.render import render as _render
@@ -444,14 +456,61 @@ def build_server(bundle_root: Path | None = None) -> FastMCP:  # noqa: C901
 
     @mcp.prompt()
     def fix_from_video(report_id: str) -> str:
-        """Script the tool sequence and emit a grounded fix prompt for a weak coder."""
+        """Emit a grounded action prompt — fix a bug, change a feature, or build new."""
         return render_fix_prompt(get_report(root, report_id))
 
     return mcp
 
 
+def mcp_command_path() -> str:
+    """Absolute path to this `framesleuth-mcp` executable.
+
+    MCP client configs do NOT expand `${workspaceFolder}` or `~` (except VS Code's
+    workspace `mcp.json`), so the command must be an absolute path. We resolve it
+    here so a generated config works in any client and any scope (user/global or
+    workspace) — avoiding the classic `spawn ${workspaceFolder}/... ENOENT`.
+    """
+    import shutil
+    import sys
+
+    found = shutil.which("framesleuth-mcp")
+    if found:
+        return str(Path(found).resolve())
+    # Fall back to a sibling of the running interpreter (the venv's bin dir).
+    candidate = Path(sys.executable).with_name("framesleuth-mcp")
+    return str(candidate.resolve() if candidate.exists() else candidate)
+
+
+def print_client_config() -> None:
+    """Print a ready-to-paste MCP client config with an absolute command path."""
+    server = {"type": "stdio", "command": mcp_command_path(), "args": []}
+    print("# Absolute-path config — works in user/global OR workspace scope,")
+    print("# in any MCP client. Do NOT use ${workspaceFolder} outside VS Code's")
+    print("# workspace mcp.json (it isn't substituted and you'll get ENOENT).\n")
+    print("# Claude Desktop / Cursor (~/.cursor/mcp.json) — key: mcpServers")
+    print(json.dumps({"mcpServers": {"framesleuth": server}}, indent=2))
+    print("\n# VS Code (.vscode/mcp.json or user settings) — key: servers")
+    print(json.dumps({"servers": {"framesleuth": server}}, indent=2))
+    print("\n# Claude Code (CLI):")
+    print(f"#   claude mcp add framesleuth -- {server['command']}")
+
+
 def main() -> None:  # pragma: no cover - process entrypoint
-    """Run the videobug MCP server over stdio."""
+    """Run the framesleuth MCP server over stdio (or print a client config)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="framesleuth-mcp", description="framesleuth MCP server (stdio)."
+    )
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help="Print a ready-to-paste MCP client config (absolute path) and exit.",
+    )
+    args = parser.parse_args()
+    if args.print_config:
+        print_client_config()
+        return
     build_server().run()
 
 

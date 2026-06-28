@@ -1,4 +1,4 @@
-"""Renderers: turn a Bug Context Bundle into a consumable end-user artifact.
+"""Renderers: turn a Context Bundle into a consumable end-user artifact.
 
 The bundle is the canonical machine output; these pure functions project it into
 human/agent-facing shapes (markdown report, GitHub issue, test plan) without

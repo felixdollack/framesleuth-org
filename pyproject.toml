@@ -66,7 +66,7 @@ all = [
 
 [project.scripts]
 framesleuth-api = "framesleuth.service.api:main"
-framesleuth-mcp = "framesleuth.mcp_server.videobug_mcp:main"
+framesleuth-mcp = "framesleuth.mcp_server.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["framesleuth"]
@@ -101,7 +101,7 @@ follow_imports = "skip"
 # The FastMCP server registers tools via the (optional, untyped) mcp SDK
 # decorators; those are an integration boundary that can't be strictly typed.
 [[tool.mypy.overrides]]
-module = ["framesleuth.mcp_server.videobug_mcp"]
+module = ["framesleuth.mcp_server.server"]
 disallow_untyped_decorators = false
 
 [tool.ruff]

@@ -1,7 +1,7 @@
 """End-to-end orchestration pipeline (stage-driven flow).
 
 Designed to *fail loud, degrade gracefully*: when the vision model or ffmpeg is
-unavailable, the orchestrator still produces a Bug Context Bundle from the
+unavailable, the orchestrator still produces a Context Bundle from the
 browser sidecars (console errors, failed requests, clicks) rather than aborting.
 """
 
@@ -23,11 +23,14 @@ from framesleuth.jobs.store import JobStore
 from framesleuth.logging_config import get_logger, set_job_id
 from framesleuth.pipeline.asr import ASRPipeline
 from framesleuth.pipeline.bug_extract import extract_bug_context_bundle
+from framesleuth.pipeline.build_context import build_build_context
 from framesleuth.pipeline.classify import (
     classify_video,
     is_ambiguous,
+    looks_like_build_intent,
     refine_classification_with_model,
 )
+from framesleuth.pipeline.confidence import assess_actionability, compute_field_confidence
 from framesleuth.pipeline.fusion import build_timeline
 from framesleuth.pipeline.grounding import locate_in_code
 from framesleuth.pipeline.preprocess import (
@@ -94,6 +97,33 @@ def _grounding_queries(evidence: list[ErrorEvidenceItem]) -> list[str]:
                     continue
                 seen.add(token)
                 queries.append(token)
+    return queries
+
+
+def _intent_queries(user_intent: str | None, scenes: list[SceneRecord]) -> list[str]:
+    """Grounding queries for build/feature work, where there is no error text.
+
+    Derives nouns from the user's request and the on-screen UI labels / screen
+    names so a feature like "add a dark-mode toggle" still grounds to the files
+    that mention "toggle"/"theme"/etc. — instead of returning nothing.
+    """
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def _add(token: str) -> None:
+        token = token.strip()
+        if len(token) >= 4 and token.lower() not in _STOPWORDS and token.lower() not in seen:
+            seen.add(token.lower())
+            queries.append(token)
+
+    for token in _IDENTIFIER_RE.findall(user_intent or ""):
+        _add(token)
+    for scene in scenes:
+        if scene.screen_name:
+            _add(scene.screen_name)
+        for el in scene.ui_elements:
+            for token in _IDENTIFIER_RE.findall(el.label):
+                _add(token)
     return queries
 
 
@@ -198,8 +228,15 @@ class AnalysisOrchestrator:
         duration_s = self._preprocess(video_path, metrics)
         transcript = self._transcribe(video_path, work_dir, metrics)
 
+        # Decide build-aware visual extraction up front (from intent + narration),
+        # because the understanding stage runs before classification.
+        transcript_text = " ".join(seg.text for seg in transcript.segments)
+        build_aware = looks_like_build_intent(user_intent, transcript_text)
+
         await self.store.update_job(job_id, state=JobState.UNDERSTANDING, progress_pct=40)
-        scenes, analyzed_frames = await self._understand(video_path, work_dir, duration_s, metrics)
+        scenes, analyzed_frames = await self._understand(
+            video_path, work_dir, duration_s, metrics, build_aware=build_aware
+        )
 
         await self.store.update_job(job_id, state=JobState.CLASSIFYING, progress_pct=65)
         sidecar_evidence, evidence_redactions = self._sidecar_evidence(parsed)
@@ -208,7 +245,11 @@ class AnalysisOrchestrator:
         error_signals = [item.text for item in sidecar_evidence]
 
         classification = classify_video(
-            transcript, scenes, settings=self.settings, error_signals=error_signals
+            transcript,
+            scenes,
+            settings=self.settings,
+            error_signals=error_signals,
+            user_intent=user_intent,
         )
         # On an ambiguous classification with visual evidence, zoom into the
         # failure window (bounded resample), then break any residual tie with a
@@ -223,9 +264,10 @@ class AnalysisOrchestrator:
             error_signals,
             classification,
             metrics,
+            user_intent=user_intent,
         )
         classification = await self._refine_classification(
-            classification, scenes, transcript, error_signals, metrics
+            classification, scenes, transcript, error_signals, metrics, user_intent=user_intent
         )
 
         # Redact OCR text from all (incl. resampled) scenes before persistence.
@@ -273,10 +315,19 @@ class AnalysisOrchestrator:
         )
 
         await self.store.update_job(job_id, state=JobState.GROUNDING, progress_pct=90)
-        bundle.code_candidates = self._ground(bundle.error_evidence, workspace_root, metrics)
+        bundle.code_candidates = self._ground(
+            bundle.error_evidence, workspace_root, metrics, user_intent=user_intent, scenes=scenes
+        )
 
-        # Derive the next-step menu last, so it reflects grounded code candidates
-        # and the final analysis quality.
+        # Assemble the build/feature context (screens, components, flow, design) and
+        # where to implement it — null for pure bug reports. Then derive per-field
+        # confidence and task-aware actionability so consumers know what to trust.
+        bundle.build_context = build_build_context(scenes, classification, bundle.code_candidates)
+        bundle.field_confidence = compute_field_confidence(bundle)
+        bundle.analysis_quality.actionability = assess_actionability(bundle)
+
+        # Derive the next-step menu last, so it reflects grounded code candidates,
+        # the build context, and the final analysis quality.
         bundle.suggested_actions = suggest_actions(bundle.model_dump(mode="json"))
 
         bundle_dir = self.settings.BUNDLE_DIR / job_id
@@ -368,16 +419,24 @@ class AnalysisOrchestrator:
         return summary
 
     async def _understand(
-        self, video_path: Path, work_dir: Path, duration_s: float, metrics: dict[str, Any]
+        self,
+        video_path: Path,
+        work_dir: Path,
+        duration_s: float,
+        metrics: dict[str, Any],
+        *,
+        build_aware: bool = False,
     ) -> tuple[list[SceneRecord], list[KeyframeRef]]:
         """Run visual understanding when frames and the VLM are available.
 
         Returns the analyzed scenes alongside the keyframes they came from, so the
-        source images can be persisted next to the bundle.
+        source images can be persisted next to the bundle. ``build_aware`` raises the
+        keyframe budget (to capture more distinct screens) and switches the per-frame
+        prompt to the structured build prompt.
         """
         start = time.perf_counter()
-        sampled = self._sample_times(duration_s)
-        keyframes = self._select_keyframes(video_path, sampled, work_dir)
+        sampled = self._sample_times(duration_s, build_aware=build_aware)
+        keyframes = self._select_keyframes(video_path, sampled, work_dir, build_aware=build_aware)
         # Only call the VLM when the keyframe images actually exist on disk.
         available = [kf for kf in keyframes if (work_dir / kf.file).exists()]
         if not available:
@@ -392,6 +451,7 @@ class AnalysisOrchestrator:
                 max_concurrency=self.settings.VLM_MAX_CONCURRENCY,
                 error_max_tokens=self.settings.VLM_ERROR_MAX_TOKENS,
                 rescue_frame=lambda t: self._rescue_frame(video_path, work_dir, t),
+                build_aware=build_aware,
             )
             metrics["stages"]["understand"] = round(time.perf_counter() - start, 3)
             return scenes, available
@@ -409,7 +469,7 @@ class AnalysisOrchestrator:
         high resolution instead. Each timestamp gets its own output dir so
         concurrent rescues never collide. Returns ``None`` if it can't be produced.
         """
-        out_dir = work_dir / "frames_hires" / str(int(round(t * 1000)))
+        out_dir = work_dir / "frames_hires" / str(round(t * 1000))
         extracted = extract_frames(
             video_path, [t], out_dir, height=self.settings.FRAME_HIGHRES_HEIGHT
         )
@@ -428,6 +488,7 @@ class AnalysisOrchestrator:
         error_signals: list[str],
         classification: Any,
         metrics: dict[str, Any],
+        user_intent: str | None = None,
     ) -> Any:
         """Resample extra frames around the failure window when classification is uncertain.
 
@@ -457,7 +518,11 @@ class AnalysisOrchestrator:
             scenes.extend(new_scenes)
             analyzed.extend(new_frames)
             classification = classify_video(
-                transcript, scenes, settings=settings, error_signals=error_signals
+                transcript,
+                scenes,
+                settings=settings,
+                error_signals=error_signals,
+                user_intent=user_intent,
             )
             attempts += 1
 
@@ -530,6 +595,7 @@ class AnalysisOrchestrator:
         transcript: Transcript,
         error_signals: list[str],
         metrics: dict[str, Any],
+        user_intent: str | None = None,
     ) -> Any:
         """Break a residual ambiguous-band tie with a model classification."""
         settings = self.settings
@@ -550,13 +616,14 @@ class AnalysisOrchestrator:
                 error_signals=error_signals,
                 client=client,
                 settings=settings,
+                user_intent=user_intent,
             )
         if refined is not classification:
             metrics["stages"]["classify_refine"] = round(time.perf_counter() - start, 3)
         return refined
 
     def _select_keyframes(
-        self, video_path: Path, sampled: list[float], frames_dir: Path
+        self, video_path: Path, sampled: list[float], frames_dir: Path, *, build_aware: bool = False
     ) -> list[KeyframeRef]:
         """Extract frames to disk and pick keyframes from real visual deltas.
 
@@ -570,7 +637,7 @@ class AnalysisOrchestrator:
             height=self.settings.FRAME_LOWRES_HEIGHT,
         )
         if extracted:
-            return self._coverage_keyframes(extracted)
+            return self._coverage_keyframes(extracted, max_keyframes=12 if build_aware else 8)
         times: list[float] = []
         files: list[str] = []
         for index, t in enumerate(sampled):
@@ -587,24 +654,29 @@ class AnalysisOrchestrator:
     def _coverage_keyframes(
         self, extracted: list[ExtractedFrame], *, max_keyframes: int = 8
     ) -> list[KeyframeRef]:
-        """Choose keyframes with guaranteed temporal coverage.
+        """Choose keyframes with adaptive, coverage-enforcing selection (AKS-lite).
 
-        A single midpoint frame (the scene-cut fallback) misses brief on-screen
-        errors. Instead analyze a uniform spread across the whole video plus the
-        highest visual-delta frames (transitions), capped to bound VLM calls.
+        Uniform sampling wastes the VLM budget on near-duplicate frames and misses
+        the salient ones. Following adaptive keyframe sampling (AKS, CVPR 2025), we
+        split the timeline into ``max_keyframes`` temporal bins (guaranteeing
+        COVERAGE) and pick the most visually salient frame — highest
+        ``change_score``, our pre-VLM RELEVANCE proxy — within each bin. Endpoints
+        are always kept so the full span is represented.
         """
         n = len(extracted)
         if n <= max_keyframes:
             chosen = set(range(n))
         else:
-            # Always keep the endpoints (full span) and the two highest-delta
-            # frames (transitions/errors), then fill with a uniform spread.
-            by_delta = sorted(range(n), key=lambda i: extracted[i].change_score, reverse=True)
-            chosen = {0, n - 1, *by_delta[:2]}
-            for i in range(max_keyframes):
+            chosen = {0, n - 1}
+            for b in range(max_keyframes):
+                lo = round(b * n / max_keyframes)
+                hi = round((b + 1) * n / max_keyframes)
+                if hi <= lo:
+                    continue
+                best = max(range(lo, hi), key=lambda i: extracted[i].change_score)
+                chosen.add(best)
                 if len(chosen) >= max_keyframes:
                     break
-                chosen.add(round(i * (n - 1) / (max_keyframes - 1)))
         return [
             KeyframeRef(index=idx, t=extracted[idx].t, shows="scene", file=extracted[idx].file)
             for idx in sorted(chosen)[:max_keyframes]
@@ -631,17 +703,20 @@ class AnalysisOrchestrator:
             except OSError as exc:
                 logger.warning("Could not persist keyframe %d: %s", idx, exc)
 
-    def _sample_times(self, duration_s: float) -> list[float]:
+    def _sample_times(self, duration_s: float, *, build_aware: bool = False) -> list[float]:
         """Pick frame timestamps to decode.
 
         Samples ~2 frames/second (capped) at the *midpoint* of each segment.
         Mid-segment sampling avoids seeking to the keyframe just before a
         transition, so brief on-screen error flashes near a boundary are caught;
         the density bounds the eventual VLM calls (scene selection caps further).
+        ``build_aware`` raises the candidate cap so the adaptive keyframe selector
+        has more distinct screens to choose from on feature/design walkthroughs.
         """
         if duration_s <= 0:
             return [0.0]
-        count = max(2, min(16, round(duration_s * 2)))
+        cap = 28 if build_aware else 16
+        count = max(2, min(cap, round(duration_s * 2)))
         step = duration_s / count
         return [round((i + 0.5) * step, 3) for i in range(count)]
 
@@ -673,12 +748,22 @@ class AnalysisOrchestrator:
         evidence: list[ErrorEvidenceItem],
         workspace_root: Path | None,
         metrics: dict[str, Any],
+        *,
+        user_intent: str | None = None,
+        scenes: list[SceneRecord] | None = None,
     ) -> list[Any]:
-        """Locate candidate code locations from error evidence when a repo is open."""
+        """Locate candidate code locations when a repo is open.
+
+        For bugs, ground the error symbols to their source. For build/feature work
+        there is no error text, so fall back to intent + on-screen UI nouns — so a
+        feature still grounds to the files to extend instead of returning nothing.
+        """
         if workspace_root is None or not workspace_root.exists():
             return []
         start = time.perf_counter()
         queries = _grounding_queries(evidence)
+        if not queries:
+            queries = _intent_queries(user_intent, scenes or [])
         candidates = locate_in_code(workspace_root, queries)
         metrics["stages"]["grounding"] = round(time.perf_counter() - start, 3)
         return candidates

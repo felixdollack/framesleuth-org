@@ -3,9 +3,9 @@
 import pytest
 
 from framesleuth.schemas import (
-    BugContextBundle,
     Classification,
     ClassificationLabel,
+    ContextBundle,
     KeyframeRef,
     Priority,
     Reproducibility,
@@ -14,12 +14,12 @@ from framesleuth.schemas import (
 )
 
 
-class TestBugContextBundle:
+class TestContextBundle:
     """Test canonical bundle schema."""
 
     def test_bundle_round_trip(self) -> None:
         """Test bundle can serialize and deserialize."""
-        bundle = BugContextBundle(
+        bundle = ContextBundle(
             id="bug_2026-06-20_001",
             source_video="test.webm",
             duration_s=60.0,
@@ -52,7 +52,7 @@ class TestBugContextBundle:
         assert isinstance(data, str)
 
         # Deserialize
-        restored = BugContextBundle.model_validate_json(data)
+        restored = ContextBundle.model_validate_json(data)
         assert restored.id == bundle.id
         assert restored.title == bundle.title
         assert restored.repro_steps[0].n == 1
@@ -60,7 +60,7 @@ class TestBugContextBundle:
     def test_bundle_validation_repro_steps_sequential(self) -> None:
         """Test repro steps must be numbered sequentially."""
         with pytest.raises(ValueError, match="sequentially"):
-            BugContextBundle(
+            ContextBundle(
                 id="bug_001",
                 source_video="test.webm",
                 duration_s=60.0,
@@ -87,7 +87,7 @@ class TestBugContextBundle:
 
     def test_bundle_validate_claims_cited(self) -> None:
         """Test citation validation helper."""
-        bundle = BugContextBundle(
+        bundle = ContextBundle(
             id="bug_001",
             source_video="test.webm",
             duration_s=60.0,

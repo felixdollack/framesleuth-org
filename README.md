@@ -4,24 +4,26 @@
 
 # Framesleuth
 
-**Local bug-reproduction video analysis, exposed over MCP.**
+**Local video → structured context for coding agents, exposed over MCP.**
 
-Framesleuth takes a bug-recording video (plus optional browser sidecars), understands it
-frame-by-frame, and produces a structured **Bug Context Bundle**. It is **MCP-ready**, so
-any MCP client — a VS Code agent, another coding agent, or a custom system — can drive the
-analysis and consume the result to fix the bug directly.
+Give Framesleuth *any* video — a bug recording, a feature demo, a design walkthrough, a
+Loom, a phone capture — and it understands it frame-by-frame (plus optional browser
+sidecars) and produces a structured **Context Bundle**. It is **MCP-ready**, so any MCP
+client — a VS Code agent, another coding agent, or a custom system — can drive the
+analysis and consume the result to **fix a bug, add or change a feature, or build a whole
+new feature/app** grounded in what the video actually shows.
 
-Capture happens outside this repo: any screen recording works, or a browser capture
-extension can record the bug and post the video + sidecars to this agent's local API.
-This repo is the analysis agent only.
+Capture happens outside this repo: any video works, or a browser capture extension can
+record a session and post the video + sidecars to this agent's local API. This repo is the
+analysis agent only.
 
 Everything runs locally. Nothing leaves your machine.
 
 ## Quick start
 
-> **Want to fix a bug from a video inside VS Code?** Follow
+> **Want to go from a video to a grounded change inside VS Code?** Follow
 > [Use with VS Code & Claude (MCP)](docs/use-with-vscode-and-claude.md) — connect
-> the bundled MCP server and go from a recording to a grounded fix.
+> the bundled MCP server and turn a recording into a fix, a feature, or a new build.
 
 ### Fastest: one command with Docker
 
@@ -66,8 +68,8 @@ not published), so it never clashes with a native Ollama you may already run on
 
 ### Run your first analysis (curl)
 
-Once the API reports healthy (either setup path), go from a recording to a Bug
-Context Bundle in three calls — analysis is async (submit → poll → read):
+Once the API reports healthy (either setup path), go from a video to a Context
+Bundle in three calls — analysis is async (submit → poll → read):
 
 ```bash
 # 1. Submit any screen recording (mp4/webm). Returns 202 { job_id, ... }
@@ -77,7 +79,7 @@ JOB=$(curl -s -F "video=@bug.mp4" http://127.0.0.1:8010/v1/analyze \
 # 2. Poll until state is "done" (queued → running → done)
 curl -s "http://127.0.0.1:8010/v1/jobs/$JOB" | python -m json.tool
 
-# 3. Read the Bug Context Bundle
+# 3. Read the Context Bundle
 curl -s "http://127.0.0.1:8010/v1/report/$JOB" | python -m json.tool
 ```
 
@@ -115,8 +117,8 @@ curl -s http://127.0.0.1:8010/v1/healthz | python -m json.tool   # status: healt
 
 When `/v1/healthz` shows `vlm: ready`, recordings analyze with a real
 classification (`analysis_quality.level` = `full`/`partial`). With no vision model
-reachable, Framesleuth **degrades gracefully** — it still produces a valid Bug
-Context Bundle from the browser sidecars (console errors, failed requests, clicks)
+reachable, Framesleuth **degrades gracefully** — it still produces a valid Context
+Bundle from the browser sidecars (console errors, failed requests, clicks)
 and records what was thin in `analysis_quality`. Record **with narration** so the
 audio transcript (`asr`) stage contributes too.
 
@@ -147,7 +149,7 @@ pkill -f "ollama serve"              # macOS app users: quit Ollama from the men
 ## Architecture
 
 ```
-Bug video (mp4/webm) + sidecars
+Any video (mp4/webm) + optional sidecars
     ↓
 Local Analysis Service (pipeline)
     ├─ Preprocess (PyAV: duration/fps/dims)
@@ -155,11 +157,11 @@ Local Analysis Service (pipeline)
     ├─ Keyframes (visual-delta change scoring)
     ├─ Understanding (local vision model — Qwen2.5-VL by default)
     ├─ Fusion + Classification
-    ├─ Extraction → Bug Context Bundle
+    ├─ Extraction → Context Bundle
     ├─ Summarize (skill/system-prompt-driven)
     └─ Grounding (workspace search)
     ↓
-Bug Context Bundle
+Context Bundle
     ↓
 MCP server + local HTTP API
     └─ consumed by any MCP client (VS Code agent, other agents, capture extension)
@@ -168,22 +170,30 @@ MCP server + local HTTP API
 ## Features
 
 - **Frame-by-frame understanding** using a local vision model (Qwen2.5-VL by default; engine-agnostic)
-- **Automatic keyframe selection** via frame-to-frame visual-delta change scoring
+- **Adaptive keyframe selection** — coverage-binned, visual-salience-ranked (AKS-style), with a build-aware budget for feature/design videos
+- **Bug *and* build** — a `feature` class plus a structured **build context** (screens, UI components, a screen-to-screen user flow, design notes, and where to implement) so an agent can implement, not just diagnose
 - **Error detection and extraction** from console, OCR, and UI state
+- **Intent-aware grounding** — error symbols *or* feature/UI nouns → ranked `file:line` (definitions preferred), so build work also lands in the right place
+- **Trust signals** — per-field confidence and a task-aware `actionability` (ready/thin/insufficient) alongside the pipeline quality level
 - **Redaction-first design** — sensitive data (passwords, tokens) redacted before models see it
 - **No data leaves your machine** — fully local, no telemetry or cloud APIs
 - **Engine-agnostic** — swap Ollama, llama.cpp, or vLLM via config only
-- **Structured output** — canonical Bug Context Bundle with evidence citations
+- **Structured output** — canonical Context Bundle with evidence citations
 - **Configurable response** — pick a summary **skill** *and* an **action mode**
-  (`fix`/`explain`/`triage`/`test`/`report`/`reproduce`, auto-picked from the
-  classification), plus a machine-readable `suggested_actions` menu and on-demand
-  artifact renderers (markdown / GitHub issue / test plan)
+  (`fix`/`implement`/`design`/`explain`/`triage`/`test`/`report`/`reproduce`,
+  auto-picked from the classification), plus a machine-readable `suggested_actions`
+  menu and on-demand artifact renderers (markdown / GitHub issue / test plan)
+- **Eval harness** — model-free classification / grounding / citation suites
+  (`python scripts/eval_harness.py --behavioral`) gate quality in CI
 - **Resilient** — handles no-audio videos, weak local models, low-confidence cases
-- **HTML → video** — render a self-contained HTML animation (CSS/JS/canvas) to
-  MP4, GIF, or WebM via the `render_html_video` MCP tool or `POST /v1/render-html`.
-  **Included by default in the Docker image** (real headless Chromium + ffmpeg, the
-  highest-fidelity path). For the direct (non-Docker) path, add the `render` extra
-  (see below); returns `503` with an actionable message when unavailable.
+- **HTML → video (frame-by-frame)** — turn a self-contained HTML animation
+  (CSS/JS/canvas) into MP4, GIF, or WebM via the `render_html_video` MCP tool or
+  `POST /v1/render-html`. Captures the animation **frame-by-frame** under a paused
+  virtual clock and encodes a color-correct H.264 MP4 (`yuv420p`+`bt709`,
+  near-lossless) — **full color, no dropped frames, no quality loss** (up to 4K,
+  5–60 fps). **Included by default in the Docker image** (headless Chromium +
+  ffmpeg). For the direct (non-Docker) path, add the `render` extra (see below);
+  returns `503` with an actionable message when unavailable.
 
 ### Enable & troubleshoot HTML → video
 
@@ -224,7 +234,7 @@ which interpreter the server uses) — or the server simply wasn't restarted.
 framesleuth/
 ├── framesleuth/              # Main package
 │   ├── config.py            # Typed config (pydantic-settings)
-│   ├── schemas.py           # Data contracts (Bug Context Bundle, enums)
+│   ├── schemas.py           # Data contracts (Context Bundle, enums)
 │   ├── errors.py            # Exception taxonomy
 │   ├── logging_config.py    # Structured JSON logging, job-id correlation
 │   ├── prompts.py           # VLM / classify / summary / fix prompt templates
@@ -236,7 +246,7 @@ framesleuth/
 │   ├── orchestrator/        # graph.py — linear async stage pipeline
 │   ├── jobs/                # store.py — SQLite job state + bundle index
 │   ├── service/             # FastAPI HTTP endpoints
-│   └── mcp_server/          # videobug MCP server (VS Code + any MCP client)
+│   └── mcp_server/          # framesleuth MCP server (VS Code + any MCP client)
 ├── tests/                   # pytest tests + fixtures
 ├── scripts/                 # doctor.py (setup check), download_models.py, dev_up.sh
 ├── postman/                 # HTTP API collection + environment
@@ -266,7 +276,7 @@ pre-commit install
 A short, focused set:
 
 - [Capabilities](docs/capabilities.md) — the single reference: every input, output, skill, action, renderer, HTTP endpoint, and MCP tool
-- [Use with VS Code & Claude (MCP)](docs/use-with-vscode-and-claude.md) — connect the `videobug` MCP server to Copilot, Claude Code, and Claude Desktop
+- [Use with VS Code & Claude (MCP)](docs/use-with-vscode-and-claude.md) — connect the `framesleuth` MCP server to Copilot, Claude Code, and Claude Desktop
 - [Web App Integration (end-to-end)](docs/web-integration.md) — embed Framesleuth behind your own backend with an agent loop
 - [Postman Collection](postman/README.md) — exercise the HTTP API end-to-end (import or run headless with Newman)
 - [Runbook & Troubleshooting](runbook.md) — setup, health checks, and common issues
@@ -280,7 +290,7 @@ Apache-2.0
 ## Capture client
 
 Bug capture lives outside this repo. Any screen recording works — drive the agent directly
-with your own video file. A browser capture extension can also record the bug, collect
+with your own video file. A browser capture extension can also record a session, collect
 browser sidecars (console errors, failed requests, clicks), and post the video + sidecars
 to this agent's local API. The agent's CORS is already scoped to `chrome-extension://`
 origins and the loopback bind, so an extension works against a locally running backend with

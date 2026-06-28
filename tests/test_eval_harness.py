@@ -1,5 +1,14 @@
 """Tests for eval harness metrics."""
 
+from pathlib import Path
+
+from framesleuth.eval import (
+    run_all,
+    run_citation_eval,
+    run_classification_eval,
+    run_grounding_eval,
+)
+from framesleuth.eval.harness import build_sample_workspace
 from scripts.eval_harness import evaluate_bundle
 
 
@@ -21,3 +30,25 @@ def test_eval_metrics_computation() -> None:
     assert metrics.repro_step_recall == 1.0
     assert metrics.error_capture_rate == 1.0
     assert metrics.grounding_hit_rate_at_k == 1.0
+
+
+def test_classification_accuracy_above_threshold() -> None:
+    result = run_classification_eval()
+    assert result.metric >= 0.8, str(result)
+
+
+def test_grounding_recall_perfect(tmp_path: Path) -> None:
+    build_sample_workspace(tmp_path)
+    result = run_grounding_eval(tmp_path)
+    assert result.metric == 1.0, str(result)
+
+
+def test_citation_integrity_perfect() -> None:
+    result = run_citation_eval()
+    assert result.metric == 1.0, str(result)
+
+
+def test_run_all_returns_every_suite(tmp_path: Path) -> None:
+    results = run_all(tmp_path)
+    assert set(results) == {"classification", "grounding", "citation"}
+    assert all(r.total > 0 for r in results.values())

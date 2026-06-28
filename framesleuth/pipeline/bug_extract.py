@@ -1,4 +1,4 @@
-"""Bug context bundle extraction with evidence and anti-fabrication guards."""
+"""Context-bundle extraction (any video) with evidence and anti-fabrication guards."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 
 from framesleuth.schemas import (
     AnalysisQuality,
-    BugContextBundle,
     Classification,
+    ContextBundle,
     ErrorEvidenceItem,
     KeyframeRef,
     Priority,
@@ -158,6 +158,9 @@ def _assess_quality(
             "scenes": len(scenes),
             "transcript_segments": len(transcript.segments),
         },
+        # Refined later by ``confidence.assess_actionability`` once the bundle
+        # (build context, candidates) is assembled; "ready" is the neutral default.
+        actionability="ready",
     )
 
 
@@ -174,7 +177,7 @@ def extract_bug_context_bundle(
     sidecar_steps: list[ReproStep] | None = None,
     sidecar_evidence: list[ErrorEvidenceItem] | None = None,
     degraded_stages: list[str] | None = None,
-) -> BugContextBundle:
+) -> ContextBundle:
     """Build canonical bundle, merging visual and sidecar evidence without fabrication."""
     scene_steps = _derive_repro_steps(scenes)
     all_steps = scene_steps + list(sidecar_steps or [])
@@ -219,7 +222,7 @@ def extract_bug_context_bundle(
     else:
         actual_behavior = "Recorded flow completed; no explicit error surfaced."
 
-    return BugContextBundle(
+    return ContextBundle(
         schema_version="1.0",
         id=job_id,
         source_video=source_video,

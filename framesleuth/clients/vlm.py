@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from framesleuth.errors import ModelUnavailableError
 from framesleuth.logging_config import get_logger
+from framesleuth.schemas import UiElement
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from framesleuth.config import Settings
@@ -68,13 +69,38 @@ def _encode_image(image_path: str, *, send_jpeg: bool, jpeg_quality: int) -> tup
 
 
 class FrameAnalysisResponse(BaseModel):
-    """Response from VLM frame analysis."""
+    """Response from VLM frame analysis.
+
+    The build-aware fields (``screen_name`` … ``ui_elements``) are populated only by
+    the build prompt for feature/demo videos; they default empty so the bug path is
+    unaffected. ``ui_elements`` is parsed leniently — a malformed element is dropped
+    rather than failing the whole frame.
+    """
 
     caption: str
     ocr_text: str
     ui_action: str | None = None
     is_error_state: bool = False
     reason: str | None = None
+    screen_name: str | None = None
+    layout: str | None = None
+    design_notes: str | None = None
+    data_shown: str | None = None
+    ui_elements: list[UiElement] = Field(default_factory=list)
+
+    @field_validator("ui_elements", mode="before")
+    @classmethod
+    def _coerce_ui_elements(cls, v: Any) -> list[dict[str, Any]]:
+        """Keep only well-formed elements (dict with kind+label); cap the count."""
+        if not isinstance(v, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in v:
+            if isinstance(item, dict) and item.get("kind") and item.get("label"):
+                out.append(item)
+            if len(out) >= 24:  # bound runaway model output
+                break
+        return out
 
 
 class VLMClient:
@@ -289,9 +315,7 @@ class VLMClient:
         # would fail identically on every attempt, so surface them immediately.
         retriable = resp.status in (429, 500, 502, 503, 504)
         if retriable and attempt < self.max_retries - 1:
-            logger.warning(
-                f"VLM returned {resp.status} (attempt {attempt + 1}/{self.max_retries})"
-            )
+            logger.warning(f"VLM returned {resp.status} (attempt {attempt + 1}/{self.max_retries})")
             return None
         if not retriable:
             body = (await resp.text())[:500]

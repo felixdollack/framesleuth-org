@@ -17,6 +17,10 @@ from framesleuth.pipeline.html_render import (
     HtmlRenderError,
     RenderOptions,
     _auto_install_enabled,
+    _frame_count,
+    _gif_args,
+    _mp4_args,
+    _webm_args,
     render_availability,
     render_html,
 )
@@ -43,14 +47,20 @@ def test_defaults_are_sane() -> None:
 
 
 def test_normalized_clamps_out_of_range_values() -> None:
-    """A caller cannot ask for a 4K, 120fps, ten-minute render."""
+    """A caller cannot ask for a 120fps, ten-minute render; 4K is the resolution cap."""
     opts = RenderOptions.normalized(
         fmt="webm", duration_s=600.0, fps=240, width=99999, height=99999
     )
     assert opts.duration_s == 30.0  # capped at _MAX_DURATION_S
     assert opts.fps == 60  # capped at _MAX_FPS
-    assert opts.width == 1920  # capped at _MAX_WIDTH
-    assert opts.height == 1080  # capped at _MAX_HEIGHT
+    assert opts.width == 3840  # capped at _MAX_WIDTH (4K)
+    assert opts.height == 2160  # capped at _MAX_HEIGHT (4K)
+
+
+def test_normalized_allows_1080p() -> None:
+    """Full-quality 1080p exports pass through unclamped."""
+    opts = RenderOptions.normalized(width=1920, height=1080)
+    assert (opts.width, opts.height) == (1920, 1080)
 
 
 def test_normalized_clamps_below_minimums() -> None:
@@ -93,6 +103,39 @@ async def test_render_html_rejects_empty_html(tmp_path: Path) -> None:
     for bad in ("", "   ", "\n\t"):
         with pytest.raises(HtmlRenderError):
             await render_html(bad, opts, tmp_path / "out")
+
+
+def test_frame_count_is_duration_times_fps_min_one() -> None:
+    """Frame-by-frame capture materializes duration x fps frames (at least one)."""
+    assert _frame_count(5.0, 30) == 150
+    assert _frame_count(2.0, 60) == 120
+    assert _frame_count(0.0, 30) == 1  # never zero frames
+    assert _frame_count(0.5, 24) == 12
+
+
+def test_mp4_args_are_color_correct_and_frame_accurate() -> None:
+    """The MP4 encode preserves color (yuv420p/bt709), is near-lossless, web-ready."""
+    args = _mp4_args("ffmpeg", "/f/%05d.png", 30, Path("/out/render.mp4"))
+    assert args[:5] == ["ffmpeg", "-y", "-framerate", "30", "-i"]
+    assert "libx264" in args
+    assert "yuv420p" in args  # broad-compatibility pixel format
+    assert "bt709" in args  # correct color primaries/transfer/space
+    assert "+faststart" in args  # immediate streaming/seeking
+    # Near-lossless quality so exported colors match the source.
+    assert args[args.index("-crf") + 1] == "16"
+
+
+def test_webm_args_use_vp9_lossless_ish() -> None:
+    args = _webm_args("ffmpeg", "/f/%05d.png", 24, Path("/out/render.webm"))
+    assert "libvpx-vp9" in args
+    assert args[args.index("-crf") + 1] == "24"
+
+
+def test_gif_args_use_per_clip_palette() -> None:
+    args = _gif_args("ffmpeg", "/f/%05d.png", 30, 1280, Path("/out/render.gif"))
+    vf = args[args.index("-vf") + 1]
+    assert "palettegen" in vf and "paletteuse" in vf
+    assert "fps=25" in vf  # clamped to the GIF fps ceiling
 
 
 def test_render_availability_reports_a_stable_shape() -> None:

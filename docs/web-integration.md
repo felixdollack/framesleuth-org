@@ -29,7 +29,7 @@ to Claude.
                                                           ▼
                                               ┌────────────────────────┐
                                               │  Framesleuth :8010      │
-                                              │  → Bug Context Bundle   │
+                                              │  → Context Bundle   │
                                               └─────────┬──────────────┘
                                        4. bundle + evidence            │
                                                           ▼
@@ -87,7 +87,7 @@ async function analyzeAndWait(file, fields) {
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  // 3. Read the Bug Context Bundle
+  // 3. Read the Context Bundle
   const report = await (await fetch(`${FRAMESLEUTH}/v1/report/${job_id}`)).json();
   return { job_id, report };
 }
@@ -126,7 +126,7 @@ Returns `202 { job_id, status: "queued", idempotent }`. Re-posting identical byt
 the cached job (`idempotent: "true"`) without re-running. Limits: `MAX_UPLOAD_MB`,
 `MAX_DURATION_S`.
 
-### Output — the Bug Context Bundle (`GET /v1/report/{id}`)
+### Output — the Context Bundle (`GET /v1/report/{id}`)
 
 The bundle the consumer reads. Key fields:
 
@@ -148,7 +148,8 @@ every supported skill, action, renderer, endpoint, and MCP tool.
 ### Also available — HTML → video (optional)
 
 Separate from the analyze loop, the backend can render a self-contained HTML
-animation (CSS/JS/canvas) to a clip: `POST /v1/render-html` with
+animation (CSS/JS/canvas) to a clip **frame-by-frame** — full color, no dropped
+frames, no quality loss (up to 4K, 5–60 fps): `POST /v1/render-html` with
 `{html, format: mp4|gif|webm, duration_s, fps, width, height}` returns the encoded
 file. It's an **optional capability** (needs the `render` extra + `ffmpeg`) and
 returns `503` when unavailable — gate your UI on `GET /v1/healthz` → `render.ready`.
@@ -295,13 +296,13 @@ behind your own confirmation UI.
 > **Why a tool, not just pasting the bundle?** The agent calls it only when needed, can
 > re-analyze with a refined intent, and the same loop scales to many tools (read repo, run
 > tests, open a PR) — the standard agentic shape. `GET /v1/report/{id}` returns the full
-> Bug Context Bundle; build your own prompt from it. Framesleuth's own grounded fix-prompt
-> template is rendered over MCP, via the `videobug://report/{id}/fix-prompt` resource.
+> Context Bundle; build your own prompt from it. Framesleuth's own grounded fix-prompt
+> template is rendered over MCP, via the `framesleuth://report/{id}/fix-prompt` resource.
 
 ### Pattern B — MCP connector (agent already speaks MCP)
 
-If your agent is MCP-native, point it at the `videobug` MCP server instead of defining a
-tool. The server exposes `analyze_video` (with `action`/`skill`), `get_bug_report`,
+If your agent is MCP-native, point it at the `framesleuth` MCP server instead of defining a
+tool. The server exposes `analyze_video` (with `action`/`skill`), `get_report`,
 `get_suggested_actions`, `get_repro_steps`, `locate_in_code`, `render`, the
 `fix-prompt`/`markdown`/`issue` resources, and more. Setup and the full tool list are in
 **[use-with-vscode-and-claude.md](use-with-vscode-and-claude.md)**. For a backend agent,

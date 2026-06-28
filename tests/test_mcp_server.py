@@ -5,13 +5,41 @@ from pathlib import Path
 
 import pytest
 
-from framesleuth.mcp_server.videobug_mcp import (
+from framesleuth.mcp_server.server import (
     build_fix_prompt_input,
     get_keyframe,
     get_report,
     list_reports,
+    mcp_command_path,
+    print_client_config,
     render_fix_prompt,
 )
+
+
+def test_mcp_command_path_is_absolute_and_named() -> None:
+    """The configured command must be an absolute `framesleuth-mcp` path.
+
+    MCP clients don't expand `${workspaceFolder}`/`~` outside VS Code's workspace
+    mcp.json, so a generated config must use an absolute path or it spawns the
+    literal string and fails with ENOENT.
+    """
+    path = mcp_command_path()
+    assert Path(path).is_absolute()
+    assert "framesleuth-mcp" in Path(path).name
+
+
+def test_print_client_config_emits_absolute_path(capsys: pytest.CaptureFixture[str]) -> None:
+    """`--print-config` prints copy-pasteable absolute-path configs for clients."""
+    print_client_config()
+    out = capsys.readouterr().out
+    # Covers Claude Desktop/Cursor (mcpServers), VS Code (servers), and the CLI.
+    assert "mcpServers" in out
+    assert '"servers"' in out
+    assert "claude mcp add framesleuth" in out
+    # The emitted command is an absolute path (never the ${workspaceFolder} var).
+    cmd = mcp_command_path()
+    assert f'"command": "{cmd}"' in out
+    assert "${workspaceFolder}" not in cmd
 
 
 def test_report_listing_and_loading(tmp_path: Path) -> None:
@@ -93,10 +121,12 @@ def test_fix_prompt_carries_user_intent() -> None:
     assert "User request" in prompt
 
 
-def test_fix_prompt_defaults_to_bug_fix_without_intent() -> None:
-    """With no intent the prompt falls back to bug-fix framing, not an empty slot."""
+def test_fix_prompt_defaults_to_neutral_framing_without_intent() -> None:
+    """With no intent the prompt falls back to a neutral act-on-the-video framing
+    (bug/feature/build), not an empty slot or a bug-only assumption."""
     prompt = render_fix_prompt(_report())
-    assert "treat the recording as a bug report" in prompt
+    assert "analyze what the video shows and act on it" in prompt
+    assert "if it's a feature/demo/walkthrough" in prompt
 
 
 def test_fix_prompt_fences_untrusted_evidence() -> None:
@@ -140,12 +170,12 @@ def test_fix_prompt_signals_high_confidence_on_full_analysis() -> None:
 
 @pytest.mark.asyncio
 async def test_build_server_registers_full_contract(tmp_path: Path) -> None:
-    """The videobug server exposes the tools/resources/prompt clients rely on.
+    """The framesleuth server exposes the tools/resources/prompt clients rely on.
 
     This is the wire contract Copilot/Claude discover over MCP; a rename or a
     dropped registration would silently break those clients, so pin it here.
     """
-    from framesleuth.mcp_server.videobug_mcp import build_server
+    from framesleuth.mcp_server.server import build_server
 
     server = build_server(tmp_path / "bundles")
 
@@ -154,8 +184,8 @@ async def test_build_server_registers_full_contract(tmp_path: Path) -> None:
         "analyze_video",
         "list_skills",
         "list_actions",
-        "list_bug_reports",
-        "get_bug_report",
+        "list_reports",
+        "get_report",
         "get_repro_steps",
         "get_error_evidence",
         "get_timeline",
@@ -169,10 +199,10 @@ async def test_build_server_registers_full_contract(tmp_path: Path) -> None:
 
     resource_uris = {tpl.uriTemplate for tpl in await server.list_resource_templates()}
     assert resource_uris == {
-        "videobug://report/{report_id}/summary",
-        "videobug://report/{report_id}/fix-prompt",
-        "videobug://report/{report_id}/markdown",
-        "videobug://report/{report_id}/issue",
+        "framesleuth://report/{report_id}/summary",
+        "framesleuth://report/{report_id}/fix-prompt",
+        "framesleuth://report/{report_id}/markdown",
+        "framesleuth://report/{report_id}/issue",
     }
 
     prompt_names = {prompt.name for prompt in await server.list_prompts()}
@@ -181,7 +211,7 @@ async def test_build_server_registers_full_contract(tmp_path: Path) -> None:
 
 def test_slim_report_keeps_action_relevant_fields() -> None:
     """The slim view keeps actionable fields and drops heavy ones."""
-    from framesleuth.mcp_server.videobug_mcp import slim_report
+    from framesleuth.mcp_server.server import slim_report
 
     report = {
         "id": "j1",

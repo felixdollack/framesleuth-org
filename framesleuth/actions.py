@@ -111,6 +111,36 @@ ACTIONS: dict[str, Action] = {
             "needed. Do NOT fix anything."
         ),
     ),
+    "implement": Action(
+        name="implement",
+        description="Build or extend the feature shown in the video, grounded in the evidence.",
+        task=(
+            "## Your task:\n"
+            "1. Restate what to build in one line, from the user's request and the "
+            "build context (screens, components, user flow).\n"
+            "2. Use the build context as the spec: implement each screen and component "
+            "shown, matching the observed labels, layout, states, and design notes.\n"
+            "3. Ground the work in the candidate locations — extend existing files where "
+            "they match, and for net-new parts state exactly which files to create and "
+            "where (use target_locations / is_greenfield).\n"
+            "4. Make the edits (or a precise, ordered patch plan) referencing real "
+            "files/paths. Reuse existing components and design tokens where they exist.\n"
+            "5. Note assumptions, anything the video did not show, and follow-ups."
+        ),
+    ),
+    "design": Action(
+        name="design",
+        description="Propose a UI/component/data design from what the video shows — no code yet.",
+        task=(
+            "## Your task:\n"
+            "Propose a concrete design for what the video shows, grounded ONLY in the "
+            "evidence. Cover: the screens and their purpose, a component breakdown "
+            "(with props/states from the observed UI elements), the user flow between "
+            "screens, the data shapes shown, and the visual style (colors/typography/"
+            "spacing from design notes). Output it as a short, buildable spec. Do NOT "
+            "write implementation code yet; flag anything the video left ambiguous."
+        ),
+    ),
 }
 
 DEFAULT_ACTION = "fix"
@@ -118,6 +148,7 @@ DEFAULT_ACTION = "fix"
 # When no action is requested, pick one from the recording's classification.
 _AUTO_BY_LABEL: dict[str, str] = {
     "bug": "fix",
+    "feature": "implement",
     "tutorial": "explain",
     "demo": "explain",
     "feedback": "report",
@@ -192,6 +223,7 @@ def suggest_actions(report: dict[str, Any]) -> list[dict[str, str]]:
     quality = str((report.get("analysis_quality") or {}).get("level", "full")).lower()
     has_errors = _has(report, "error_evidence")
     has_candidates = _has(report, "code_candidates")
+    has_build = _has(report, "build_context")
 
     suggestions: list[dict[str, str]] = []
 
@@ -213,7 +245,7 @@ def suggest_actions(report: dict[str, Any]) -> list[dict[str, str]]:
             "propose_fix",
             "Propose a grounded fix",
             "A failure was observed; the fix-prompt confirms the root cause from cited evidence.",
-            f"resource videobug://report/{report_id}/fix-prompt",
+            f"resource framesleuth://report/{report_id}/fix-prompt",
         )
         add(
             "write_test",
@@ -225,9 +257,11 @@ def suggest_actions(report: dict[str, Any]) -> list[dict[str, str]]:
             "locate_in_code",
             "Locate the suspect code",
             "Ground the error text to candidate files/lines in the repo.",
-            "tool locate_in_code(report_id, repo_root)"
-            if not has_candidates
-            else "report.code_candidates",
+            (
+                "tool locate_in_code(report_id, repo_root)"
+                if not has_candidates
+                else "report.code_candidates"
+            ),
         )
         add(
             "open_issue",
@@ -235,12 +269,35 @@ def suggest_actions(report: dict[str, Any]) -> list[dict[str, str]]:
             "Hand off a ready-to-paste bug report.",
             "tool render(report_id, 'issue')",
         )
+    elif label == "feature" or has_build:
+        add(
+            "implement",
+            "Build the feature from the video",
+            "The build context (screens, components, flow) is a buildable spec.",
+            f"resource framesleuth://report/{report_id}/fix-prompt",
+        )
+        add(
+            "design",
+            "Propose a design / component spec",
+            "Turn the observed UI into a concrete design before writing code.",
+            "tool analyze_video(action='design')",
+        )
+        add(
+            "locate_in_code",
+            "Find where to implement it",
+            "Ground the feature to existing files to extend, or flag net-new locations.",
+            (
+                "tool locate_in_code(report_id, repo_root)"
+                if not has_candidates
+                else "report.code_candidates"
+            ),
+        )
     elif label in {"tutorial", "demo"}:
         add(
             "explain",
             "Explain / document what was shown",
             "The recording demonstrates a flow rather than a failure.",
-            f"resource videobug://report/{report_id}/summary",
+            f"resource framesleuth://report/{report_id}/summary",
         )
         add(
             "write_docs",
@@ -253,7 +310,7 @@ def suggest_actions(report: dict[str, Any]) -> list[dict[str, str]]:
             "summarize",
             "Summarize the recording",
             "Capture what was said/shown for follow-up.",
-            f"resource videobug://report/{report_id}/summary",
+            f"resource framesleuth://report/{report_id}/summary",
         )
         add(
             "open_issue",

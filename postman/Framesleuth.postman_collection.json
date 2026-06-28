@@ -211,7 +211,7 @@
       ]
     },
     {
-      "name": "Get report (Bug Context Bundle)",
+      "name": "Get report (Context Bundle)",
       "request": {
         "method": "GET",
         "header": [],
@@ -220,7 +220,7 @@
           "host": ["{{baseUrl}}"],
           "path": ["v1", "report", "{{jobId}}"]
         },
-        "description": "The canonical structured output — the Bug Context Bundle. Key fields: `title`, `classification`, `repro_steps`, `error_evidence`, `keyframe_refs`, `code_candidates`, `user_intent`, `action` (resolved response mode), `suggested_actions` (machine-readable next-step menu), and `analysis_quality` (trust signal: `full` | `partial` | `degraded`, with `warnings` and `evidence_counts`).\n\n409 if the report isn't ready yet; 404 if the job is unknown."
+        "description": "The canonical structured output — the Context Bundle (any video: bug, feature, demo, build). Key fields: `title`, `classification`, `repro_steps`, `error_evidence`, `keyframe_refs`, `code_candidates`, `user_intent`, `action` (resolved response mode), `suggested_actions` (machine-readable next-step menu), and `analysis_quality` (trust signal: `full` | `partial` | `degraded`, with `warnings` and `evidence_counts`).\n\n409 if the report isn't ready yet; 404 if the job is unknown."
       },
       "event": [
         {

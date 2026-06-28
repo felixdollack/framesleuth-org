@@ -1,9 +1,13 @@
 """Render an HTML document (CSS / JS / canvas animation) to a video or GIF.
 
 This is the "design animation → shareable clip" capability: a self-contained
-HTML page (e.g. one Claude generated) is loaded in a headless Chromium, its
-animation is recorded for a bounded duration, and the recording is encoded to
-``mp4`` / ``gif`` / ``webm``.
+HTML page (e.g. one Claude generated) is loaded in a headless Chromium and
+captured **frame-by-frame** under a paused virtual clock — each frame a lossless,
+full-resolution PNG at an exact timestamp, so there are no dropped frames and no
+color loss (unlike screen recording). The PNG sequence is then encoded to a
+color-correct ``mp4`` (H.264, ``yuv420p``+``bt709``, near-lossless), ``webm``
+(VP9), or palette ``gif``. If deterministic capture is unavailable on the running
+Chromium, it falls back to real-time recording so the feature still works.
 
 Unlike the rest of the media layer (which uses PyAV so no system ``ffmpeg`` is
 required), this is an **optional, heavier** capability: it needs Playwright's
@@ -19,6 +23,8 @@ crashing the server, so the rest of the agent is unaffected when they're absent.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import importlib.metadata as metadata
 import os
 import shutil
@@ -26,7 +32,13 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Optional dependency (the `render` extra). Imported for typing only so the
+    # viewport dict matches Playwright's ViewportSize TypedDict without making
+    # playwright a hard import at module load.
+    from playwright.async_api import ViewportSize
 
 from framesleuth.logging_config import get_logger
 
@@ -34,15 +46,22 @@ logger = get_logger("pipeline.html_render")
 
 SUPPORTED_FORMATS: tuple[str, ...] = ("mp4", "gif", "webm")
 
-# Guard rails so a caller cannot ask for a 4K, 60fps, ten-minute render.
+# Guard rails so a caller cannot ask for a ten-minute render. Resolution goes up
+# to 4K so exports are crisp; duration stays bounded since frame-by-frame capture
+# materializes one lossless PNG per frame (duration x fps images).
 _MIN_DURATION_S = 0.5
 _MAX_DURATION_S = 30.0
 _MIN_FPS = 5
 _MAX_FPS = 60
-_GIF_MAX_FPS = 20
+_GIF_MAX_FPS = 25
 _MIN_DIM = 64
-_MAX_WIDTH = 1920
-_MAX_HEIGHT = 1080
+_MAX_WIDTH = 3840
+_MAX_HEIGHT = 2160
+
+# Near-lossless H.264 (visually transparent) so exported colors match the source.
+_H264_CRF = "16"
+# VP9 quality (lower = better); 24 is high quality at a sane size.
+_VP9_CRF = "24"
 
 
 class HtmlRenderError(Exception):
@@ -92,6 +111,52 @@ def _ffmpeg_path() -> str:
             "ffmpeg is not installed (needed to encode mp4/gif). Install it and retry."
         )
     return exe
+
+
+def _frame_count(duration_s: float, fps: int) -> int:
+    """Number of lossless frames to capture for a duration at fps (at least 1)."""
+    return max(1, round(duration_s * fps))
+
+
+def _frames_glob(frames_dir: Path) -> str:
+    """Input pattern (for ffmpeg) over the captured PNG sequence."""
+    return str(frames_dir / "%05d.png")
+
+
+def _mp4_args(ffmpeg: str, frames_glob: str, fps: int, out: Path) -> list[str]:
+    """Encode the PNG sequence to web-ready, color-correct H.264 MP4.
+
+    ``-crf 16`` is visually transparent (no banding/quality loss), ``yuv420p`` +
+    ``bt709`` tags keep colors correct across players, ``+faststart`` makes it
+    stream/seek immediately. Exact ``-framerate`` because frames are deterministic.
+    """
+    return [
+        ffmpeg, "-y", "-framerate", str(fps), "-i", frames_glob,
+        "-c:v", "libx264", "-preset", "medium", "-crf", _H264_CRF,
+        "-pix_fmt", "yuv420p",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+        "-movflags", "+faststart", str(out),
+    ]  # fmt: skip
+
+
+def _webm_args(ffmpeg: str, frames_glob: str, fps: int, out: Path) -> list[str]:
+    """Encode the PNG sequence to high-quality VP9 WebM."""
+    return [
+        ffmpeg, "-y", "-framerate", str(fps), "-i", frames_glob,
+        "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
+        "-b:v", "0", "-crf", _VP9_CRF, "-row-mt", "1", str(out),
+    ]  # fmt: skip
+
+
+def _gif_args(ffmpeg: str, frames_glob: str, fps: int, width: int, out: Path) -> list[str]:
+    """Encode the PNG sequence to a GIF via a per-clip palette (clean colors)."""
+    gif_fps = min(fps, _GIF_MAX_FPS)
+    vf = (
+        f"fps={gif_fps},scale={width}:-1:flags=lanczos,"
+        "split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+        "[s1][p]paletteuse=dither=bayer:bayer_scale=5"
+    )
+    return [ffmpeg, "-y", "-framerate", str(fps), "-i", frames_glob, "-vf", vf, str(out)]
 
 
 def _browsers_base_dir() -> Path:
@@ -217,10 +282,12 @@ async def _ensure_chromium() -> None:
         logger.info("Chromium is ready.")
 
 
-async def _record_webm(html: str, opts: RenderOptions, out_dir: Path) -> Path:
-    """Render the HTML in headless Chromium and record a WebM of the animation."""
+def _import_playwright() -> Any:
+    """Lazily import ``async_playwright`` with actionable error messages."""
     try:
         from playwright.async_api import async_playwright  # lazy: optional dep
+
+        return async_playwright
     except ModuleNotFoundError as exc:
         raise HtmlRenderError(
             "Playwright is not installed in this environment "
@@ -233,21 +300,103 @@ async def _record_webm(html: str, opts: RenderOptions, out_dir: Path) -> Path:
             'Reinstall with: uv pip install --reinstall -e ".[render]"'
         ) from exc
 
-    size = {"width": opts.width, "height": opts.height}
+
+async def _launch_browser(pw: Any) -> Any:
+    """Launch headless Chromium, auto-installing it once if the binary is missing."""
+    try:
+        return await pw.chromium.launch(args=["--no-sandbox"])
+    except Exception as exc:
+        if any(s in str(exc).lower() for s in _MISSING_BROWSER) and _auto_install_enabled():
+            await _ensure_chromium()
+            try:
+                return await pw.chromium.launch(args=["--no-sandbox"])
+            except Exception as exc2:
+                raise HtmlRenderError(_launch_hint(exc2)) from exc2
+        raise HtmlRenderError(_launch_hint(exc)) from exc
+
+
+async def _advance_virtual_time(cdp: Any, budget_ms: float) -> None:
+    """Advance the renderer's virtual clock by ``budget_ms`` and wait for it to drain.
+
+    Under a paused virtual-time policy the whole renderer clock — ``requestAnimation
+    Frame``, ``setTimeout``, CSS animations, Web Animations — is frozen, so advancing
+    a fixed budget per frame produces deterministic, evenly spaced frames regardless
+    of how heavy the animation is (no dropped or duplicated frames).
+    """
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future[None] = loop.create_future()
+
+    def _on_expired(_: Any) -> None:
+        if not fut.done():
+            fut.set_result(None)
+
+    cdp.on("Emulation.virtualTimeBudgetExpired", _on_expired)
+    try:
+        await cdp.send(
+            "Emulation.setVirtualTimePolicy",
+            {"policy": "advance", "budget": budget_ms},
+        )
+        await asyncio.wait_for(fut, timeout=15.0)
+    finally:
+        # Listener-API differences across Playwright versions must never break a render.
+        with contextlib.suppress(Exception):
+            cdp.remove_listener("Emulation.virtualTimeBudgetExpired", _on_expired)
+
+
+async def _capture_frames(html: str, opts: RenderOptions, frames_dir: Path) -> int:
+    """Capture a deterministic, lossless PNG per frame via CDP virtual time.
+
+    This is the high-fidelity path (like a frame-by-frame exporter): each frame is
+    a full-quality PNG screenshot taken at an exact virtual timestamp, so the result
+    has no dropped frames and no color loss — the encoder just muxes them at the
+    requested fps. Returns the number of frames written.
+    """
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    async_playwright = _import_playwright()
+    n = _frame_count(opts.duration_s, opts.fps)
+    frame_ms = 1000.0 / opts.fps
+    size: ViewportSize = {"width": opts.width, "height": opts.height}
+
     async with async_playwright() as pw:
+        browser = await _launch_browser(pw)
+        context = await browser.new_context(viewport=size, device_scale_factor=1)
+        page = await context.new_page()
+        cdp = await context.new_cdp_session(page)
         try:
-            browser = await pw.chromium.launch(args=["--no-sandbox"])
-        except Exception as exc:
-            # If only the browser binary is missing, fetch it once and retry —
-            # so installing the `render` extra is the only manual step.
-            if any(s in str(exc).lower() for s in _MISSING_BROWSER) and _auto_install_enabled():
-                await _ensure_chromium()
-                try:
-                    browser = await pw.chromium.launch(args=["--no-sandbox"])
-                except Exception as exc2:
-                    raise HtmlRenderError(_launch_hint(exc2)) from exc2
-            else:
-                raise HtmlRenderError(_launch_hint(exc)) from exc
+            await page.set_content(html, wait_until="load")
+            # Let fonts/first paint settle before the clock is frozen.
+            with contextlib.suppress(Exception):
+                await page.evaluate("document.fonts && document.fonts.ready")
+            await page.wait_for_timeout(60)
+            # Freeze the clock, then step one frame budget at a time.
+            await cdp.send("Emulation.setVirtualTimePolicy", {"policy": "pause"})
+            for i in range(n):
+                if i > 0:
+                    await _advance_virtual_time(cdp, frame_ms)
+                shot = await cdp.send(
+                    "Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False}
+                )
+                (frames_dir / f"{i:05d}.png").write_bytes(base64.b64decode(shot["data"]))
+        finally:
+            await context.close()
+            await browser.close()
+
+    if not any(frames_dir.glob("*.png")):
+        raise HtmlRenderError("Frame capture produced no images.")
+    return n
+
+
+async def _record_webm(html: str, opts: RenderOptions, out_dir: Path) -> Path:
+    """Fallback: record a real-time WebM of the animation in headless Chromium.
+
+    Used only when deterministic frame capture is unavailable (older Chromium /
+    CDP virtual-time failure). Lower fidelity than frame-by-frame because the
+    recorder samples in real time, but keeps the feature working.
+    """
+    async_playwright = _import_playwright()
+    size: ViewportSize = {"width": opts.width, "height": opts.height}
+    async with async_playwright() as pw:
+        browser = await _launch_browser(pw)
         context = await browser.new_context(
             viewport=size,
             record_video_dir=str(out_dir),
@@ -279,47 +428,71 @@ async def _run_ffmpeg(args: list[str]) -> None:
         raise HtmlRenderError(f"ffmpeg failed: {detail}")
 
 
-async def render_html(html: str, opts: RenderOptions, out_dir: Path) -> Path:
-    """Render ``html`` to a clip and return the path to the encoded file.
+def _force_realtime() -> bool:
+    """Opt-in escape hatch to skip frame-by-frame capture (debug/diagnostics)."""
+    return os.environ.get("FRAMESLEUTH_RENDER_MODE", "").strip().lower() == "realtime"
 
-    The output format is ``opts.fmt`` (``mp4`` / ``gif`` / ``webm``). Raises
-    :class:`HtmlRenderError` on any unrecoverable problem (missing Playwright /
-    ffmpeg, launch failure, empty recording, encode failure).
-    """
-    if not html or not html.strip():
-        raise HtmlRenderError("No HTML was provided.")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
+async def _encode_from_frames(opts: RenderOptions, frames_dir: Path, out_dir: Path) -> Path:
+    """Encode the captured PNG sequence to the requested format (color-correct)."""
+    ffmpeg = _ffmpeg_path()
+    glob = _frames_glob(frames_dir)
+    if opts.fmt == "mp4":
+        out = out_dir / "render.mp4"
+        await _run_ffmpeg(_mp4_args(ffmpeg, glob, opts.fps, out))
+    elif opts.fmt == "webm":
+        out = out_dir / "render.webm"
+        await _run_ffmpeg(_webm_args(ffmpeg, glob, opts.fps, out))
+    else:  # gif
+        out = out_dir / "render.gif"
+        await _run_ffmpeg(_gif_args(ffmpeg, glob, opts.fps, opts.width, out))
+    return out
+
+
+async def _render_realtime(html: str, opts: RenderOptions, out_dir: Path) -> Path:
+    """Real-time recording fallback: record WebM, then transcode if needed."""
     webm = await _record_webm(html, opts, out_dir)
     if opts.fmt == "webm":
         return webm
-
     ffmpeg = _ffmpeg_path()
     if opts.fmt == "mp4":
         out = out_dir / "render.mp4"
         await _run_ffmpeg(
             [
-                ffmpeg,
-                "-y",
-                "-i",
-                str(webm),
-                "-movflags",
-                "+faststart",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "libx264",
-                str(out),
-            ]
+                ffmpeg, "-y", "-i", str(webm),
+                "-movflags", "+faststart", "-pix_fmt", "yuv420p", "-c:v", "libx264", str(out),
+            ]  # fmt: skip
         )
         return out
-
-    # gif: two-pass palette for clean colors at a sane frame rate.
     out = out_dir / "render.gif"
-    gif_fps = min(opts.fps, _GIF_MAX_FPS)
-    vf = (
-        f"fps={gif_fps},scale={opts.width}:-1:flags=lanczos,"
-        "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-    )
-    await _run_ffmpeg([ffmpeg, "-y", "-i", str(webm), "-vf", vf, str(out)])
+    await _run_ffmpeg(_gif_args(ffmpeg, str(webm), opts.fps, opts.width, out))
     return out
+
+
+async def render_html(html: str, opts: RenderOptions, out_dir: Path) -> Path:
+    """Render ``html`` to a clip and return the path to the encoded file.
+
+    Primary path: **frame-by-frame** — capture a lossless PNG per frame at an exact
+    virtual timestamp, then encode at the requested fps. This preserves every color
+    and drops no frames (matching dedicated animation exporters). If deterministic
+    capture is unavailable (older Chromium / CDP virtual-time failure) it falls back
+    to real-time recording so the feature still works.
+
+    The output format is ``opts.fmt`` (``mp4`` / ``gif`` / ``webm``). Raises
+    :class:`HtmlRenderError` on missing Playwright/ffmpeg or an unrecoverable encode.
+    """
+    if not html or not html.strip():
+        raise HtmlRenderError("No HTML was provided.")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not _force_realtime():
+        frames_dir = out_dir / "frames"
+        try:
+            await _capture_frames(html, opts, frames_dir)
+            return await _encode_from_frames(opts, frames_dir, out_dir)
+        except HtmlRenderError:
+            raise  # missing deps / encode failure — surface the actionable message
+        except Exception as exc:  # capture-specific failure → degrade, don't fail
+            logger.warning("Frame-by-frame capture failed (%s); using real-time recording.", exc)
+
+    return await _render_realtime(html, opts, out_dir)

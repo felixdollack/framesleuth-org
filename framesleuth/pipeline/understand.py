@@ -51,12 +51,20 @@ async def _analyze_one(
     min_ocr_len: int,
     error_max_tokens: int | None,
     rescue_frame: RescueFrame | None,
+    build_aware: bool,
 ) -> SceneRecord:
-    """Analyze a single keyframe, retrying once for sparse error-frame OCR."""
+    """Analyze a single keyframe, retrying once for sparse error-frame OCR.
+
+    When ``build_aware`` is set (feature/demo/build videos), the first pass uses the
+    build prompt that additionally extracts structured UI elements, layout, screen
+    name, and design notes — the inputs a coding agent needs to *build* what was
+    shown. The error re-OCR retry still uses the focused error template.
+    """
     from framesleuth.prompts import VLMPrompts
 
     image_path = str(frames_dir / keyframe.file)
-    response = await vlm_client.analyze_frame(image_path, keyframe.t)
+    first_prompt = VLMPrompts.frame_analysis_build(keyframe.t) if build_aware else None
+    response = await vlm_client.analyze_frame(image_path, keyframe.t, prompt_override=first_prompt)
 
     # Re-prompt with the tuned error template when the frame looks like a failure
     # but the OCR came back too sparse to be useful — a weak model often misses
@@ -81,6 +89,11 @@ async def _analyze_one(
         ui_action=response.ui_action,
         is_error_state=response.is_error_state,
         reason=response.reason,
+        ui_elements=response.ui_elements,
+        layout=response.layout,
+        screen_name=response.screen_name,
+        design_notes=response.design_notes,
+        data_shown=response.data_shown,
     )
 
 
@@ -93,6 +106,7 @@ async def analyze_keyframes(
     max_concurrency: int = 3,
     error_max_tokens: int | None = None,
     rescue_frame: RescueFrame | None = None,
+    build_aware: bool = False,
 ) -> list[SceneRecord]:
     """Analyze keyframes concurrently and return scene records in keyframe order.
 
@@ -116,6 +130,7 @@ async def analyze_keyframes(
                 min_ocr_len=min_ocr_len,
                 error_max_tokens=error_max_tokens,
                 rescue_frame=rescue_frame,
+                build_aware=build_aware,
             )
 
     # gather preserves input order, keeping scenes aligned with their keyframes.

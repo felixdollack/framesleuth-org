@@ -15,9 +15,16 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class ClassificationLabel(StrEnum):
-    """Video classification labels."""
+    """Video classification labels.
+
+    ``feature`` covers "build/add/change this" intent — a feature demo, a design
+    walkthrough, or a spoken request to implement something. It routes to the
+    ``implement`` action and drives ``BuildContext`` extraction, so the agent is a
+    first-class build assistant, not only a bug fixer.
+    """
 
     BUG = "bug"
+    FEATURE = "feature"
     TUTORIAL = "tutorial"
     DEMO = "demo"
     FEEDBACK = "feedback"
@@ -86,6 +93,24 @@ class Transcript(BaseModel):
     words: list[dict[str, Any]] | None = Field(None, description="Word-level timing if available")
 
 
+class UiElement(BaseModel):
+    """A structured UI element observed in a frame (build/feature context).
+
+    Captured so a coding agent can *rebuild* what was shown, not just read a
+    caption. Populated by the build-aware frame prompt for non-bug videos.
+    """
+
+    kind: str = Field(
+        ...,
+        description="button | input | link | text | image | icon | list | table | "
+        "modal | nav | card | tab | toggle | other",
+    )
+    label: str = Field(..., description="Visible text/label on the element")
+    state: str | None = Field(
+        None, description="Observed state, e.g. disabled, active, focused, selected, error"
+    )
+
+
 class SceneRecord(BaseModel):
     """Visual scene record from frame analysis."""
 
@@ -96,6 +121,22 @@ class SceneRecord(BaseModel):
     ui_action: str | None = Field(None, description="Apparent user action (click, type, etc.)")
     is_error_state: bool = Field(False, description="Whether scene shows an error or failure")
     reason: str | None = Field(None, description="Why this frame is marked as error state")
+    # Build/feature context — populated by the build-aware prompt for non-bug videos.
+    ui_elements: list[UiElement] = Field(
+        default_factory=list, description="Structured UI elements observed in the frame"
+    )
+    layout: str | None = Field(
+        None, description="Spatial layout, e.g. 'sidebar left, main content right, modal centered'"
+    )
+    screen_name: str | None = Field(
+        None, description="Inferred screen/page/route name (from title, URL, or heading)"
+    )
+    design_notes: str | None = Field(
+        None, description="Colors, typography, spacing, and visual style observed"
+    )
+    data_shown: str | None = Field(
+        None, description="Structured data visible, e.g. table columns or list item shape"
+    )
 
 
 class PreprocessResult(BaseModel):
@@ -196,10 +237,85 @@ class AnalysisQuality(BaseModel):
         default_factory=dict,
         description="Counts of extracted evidence (keyframes, errors, repro_steps, transcript)",
     )
+    actionability: Literal["ready", "thin", "insufficient"] = Field(
+        "ready",
+        description="Whether the evidence suffices for the RESOLVED action (independent of which "
+        "stages ran). ready=act on it; thin=act but flag gaps; insufficient=gather more.",
+    )
 
 
-class BugContextBundle(BaseModel):
-    """The canonical output: complete structured bug context.
+class UiComponent(BaseModel):
+    """A distinct UI component aggregated across frames (build/feature context)."""
+
+    kind: str = Field(
+        ..., description="button | input | form | list | table | modal | nav | card | …"
+    )
+    label: str = Field(..., description="Visible label/identifier")
+    screen: str | None = Field(None, description="Screen/page where it appears")
+    states: list[str] = Field(default_factory=list, description="Observed states across frames")
+    evidence: list[str] = Field(default_factory=list, description="Frame citations, e.g. 'frame:3'")
+
+
+class Screen(BaseModel):
+    """A distinct screen/page/route shown in the video."""
+
+    name: str = Field(..., description="Screen/page/route name")
+    summary: str = Field("", description="One-line description of the screen")
+    t: float = Field(..., description="First-seen timestamp (seconds)")
+    components: list[str] = Field(
+        default_factory=list, description="Component labels on this screen"
+    )
+    evidence: list[str] = Field(default_factory=list, description="Frame citations")
+
+
+class FlowStep(BaseModel):
+    """A transition in the user flow: from one screen to the next via an action."""
+
+    n: int = Field(..., ge=1, description="Step number in the flow")
+    from_screen: str | None = Field(None, description="Screen before the action")
+    action: str | None = Field(None, description="The action that caused the transition")
+    to_screen: str | None = Field(None, description="Screen after the action")
+    t: float = Field(..., description="Timestamp of the transition (seconds)")
+
+
+class BuildContext(BaseModel):
+    """Structured "what to build" context for feature / build / demo / design videos.
+
+    This is the build counterpart to the bug-oriented fields. It gives a coding
+    agent a buildable model of the video — screens, components, the user flow
+    between them, design notes, and where in the codebase to implement — instead
+    of a flat caption + OCR blob.
+    """
+
+    screens: list[Screen] = Field(default_factory=list)
+    components: list[UiComponent] = Field(default_factory=list)
+    user_flow: list[FlowStep] = Field(
+        default_factory=list, description="Screen-to-screen transitions"
+    )
+    design_notes: list[str] = Field(
+        default_factory=list, description="Colors, typography, spacing, visual style observed"
+    )
+    data_models: list[str] = Field(
+        default_factory=list, description="Data shapes shown (table columns, list item fields)"
+    )
+    is_greenfield: bool = Field(
+        False, description="True when this appears net-new — no matching existing code was found"
+    )
+    target_locations: list[str] = Field(
+        default_factory=list,
+        description="Where to implement: existing dirs/files to extend, or new-file hints",
+    )
+
+
+class ContextBundle(BaseModel):
+    """The canonical output: complete structured context extracted from a video.
+
+    Framesleuth works on *any* video — a bug recording, a feature demo, a design
+    walkthrough, a Loom, a phone capture — and distills it into this single
+    structured artifact a coding agent can act on: to fix a bug, add or change a
+    feature, or build something new. Bug-oriented fields (``severity``,
+    ``priority``, ``suspected_component``) double as generic triage signals for
+    non-bug work (how urgent/important the task is and where it lives in the code).
 
     This is the primary artifact delivered to both VS Code and Chrome surfaces.
     Schema versioning enables forward migration and compatibility checks.
@@ -229,9 +345,21 @@ class BugContextBundle(BaseModel):
     error_evidence: list[ErrorEvidenceItem] = Field(default_factory=list)
     keyframe_refs: list[KeyframeRef] = Field(default_factory=list)
 
+    build_context: BuildContext | None = Field(
+        default=None,
+        description="Structured build/feature context (screens, components, user flow, design). "
+        "Populated for feature/demo/build videos; null for pure bug reports.",
+    )
+
     analysis_quality: AnalysisQuality = Field(
-        default_factory=lambda: AnalysisQuality(level="full"),
+        default_factory=lambda: AnalysisQuality(level="full", actionability="ready"),
         description="Pipeline completeness/confidence signal for downstream consumers",
+    )
+
+    field_confidence: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-field confidence 0-1 for key fields (title, repro_steps, severity, "
+        "suspected_component, build_context) so consumers know which claims to trust.",
     )
 
     summary: str = Field(

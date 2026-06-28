@@ -40,6 +40,50 @@ Rules:
 - Return ONLY the JSON, no other text."""
 
     @staticmethod
+    def frame_analysis_build(t: float) -> str:
+        """Build-aware per-frame prompt for feature / demo / design videos.
+
+        Extends the base analysis with STRUCTURED UI capture so a coding agent can
+        rebuild what was shown — components, layout, screen name, design tokens,
+        and data shape — not just a caption. Mirrors current UI-to-code practice of
+        extracting a component model and design tokens rather than a flat caption.
+
+        Args:
+            t: Timestamp in seconds.
+
+        Returns:
+            Prompt instructing the VLM to return extended JSON analysis.
+        """
+        return f"""You are analyzing ONE frame of a screen recording at t={t}s. The
+viewer wants to BUILD what is shown, so capture the UI precisely and structurally.
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "caption": "<one sentence describing what is visible>",
+  "ocr_text": "<every visible text string, verbatim, as a single string>",
+  "ui_action": "<apparent user action like 'click', 'type', 'scroll', or null if none>",
+  "is_error_state": <true or false>,
+  "reason": "<if error, explain why; otherwise null>",
+  "screen_name": "<the screen/page/route name from the title, URL, or main heading, or null>",
+  "layout": "<short spatial layout, e.g. 'left sidebar, main content right, top nav', or null>",
+  "design_notes": "<colors, typography, spacing, and visual style you can observe, or null>",
+  "data_shown": "<structured data visible: table columns or list-item fields, or null>",
+  "ui_elements": [
+    {{"kind": "button|input|link|text|image|icon|list|table|modal|nav|card|tab|toggle|other",
+      "label": "<visible label/text>",
+      "state": "<disabled|active|focused|selected|error or null>"}}
+  ]
+}}
+
+Rules:
+- List the salient interactive elements in "ui_elements" (buttons, inputs, nav, cards…),
+  with their visible labels. Skip decorative pixels; capture what a developer must build.
+- "screen_name" should be a short identifier like "Checkout", "Settings", or "/products".
+- Read small text carefully and capture filenames, line numbers, URLs exactly as shown.
+- If something is unreadable or absent, use null (or [] for ui_elements); do NOT guess.
+- Return ONLY the JSON, no other text."""
+
+    @staticmethod
     def error_frame_analysis(t: float) -> str:
         """Focused prompt for analyzing suspected error frames.
 
@@ -82,12 +126,15 @@ class ClassificationPrompts:
         Returns:
             Prompt for classification.
         """
-        return f"""Classify this video into one category: bug, tutorial, demo, feedback, or other.
+        return f"""Classify this video into one category: bug, feature, tutorial, demo, \
+feedback, or other.
 
 A "bug" depicts unexpected or erroneous software behavior that should not occur.
-A "tutorial" shows step-by-step instructions.
-A "demo" shows intentional system behavior.
-A "feedback" describes suggestions or feature requests.
+A "feature" shows or asks to build/add/change functionality (a feature demo, a design
+  walkthrough, or a spoken request like "add a dark mode toggle" / "build this screen").
+A "tutorial" shows step-by-step instructions for using existing functionality.
+A "demo" shows intentional, working system behavior.
+A "feedback" describes suggestions or opinions without a concrete build request.
 A "other" is none of the above.
 
 Video summary:
@@ -97,10 +144,11 @@ Signals:
 - Error messages found: {signals.get('error_count', 0)}
 - Exception stack frames: {signals.get('has_stack_trace', False)}
 - Error state frames detected: {signals.get('error_frames', 0)}
+- Build/feature intent phrases: {signals.get('feature_intent', False)}
 
 Return ONLY valid JSON:
 {{
-  "label": "bug" | "tutorial" | "demo" | "feedback" | "other",
+  "label": "bug" | "feature" | "tutorial" | "demo" | "feedback" | "other",
   "confidence": <0.0 to 1.0>,
   "alt_labels": [["label", <confidence>], ...]
 }}
@@ -109,7 +157,7 @@ Confidence should reflect how certain you are. If uncertain, use 0.5-0.7."""
 
 
 class FixPrompts:
-    """Prompts for code fixing (rendered by MCP and report exports)."""
+    """Prompts for code actions — fix, feature, build (rendered by MCP and report exports)."""
 
     @staticmethod
     def fix_from_video(
@@ -125,17 +173,19 @@ class FixPrompts:
         keyframe_path: str | None = None,
         user_request: str | None = None,
         quality: dict[str, Any] | None = None,
+        build_context: dict[str, Any] | None = None,
         task: str | None = None,
     ) -> str:
         """Prompt to drive a coding agent to act on video evidence.
 
         The prompt leads with the user's own request (fix a bug, add a feature,
-        explain, etc.) so the downstream agent (Copilot/Claude) carries out *that*
-        action grounded in the extracted evidence. With no request it defaults to
-        bug-fix framing.
+        explain, build something new, etc.) so the downstream agent
+        (Copilot/Claude) carries out *that* action grounded in the extracted
+        evidence. With no request it defaults to a neutral "analyze what the video
+        shows and act on it" framing.
 
         Args:
-            title: Bug/observation title.
+            title: Title/observation summarizing what the video shows.
             severity: Severity level.
             component: Suspected component.
             environment: OS, app, version, browser.
@@ -148,6 +198,8 @@ class FixPrompts:
             user_request: The user's natural-language instruction, if provided.
             quality: Analysis-quality signal (level, warnings) so the agent knows
                 how much to trust the evidence and when to gather more.
+            build_context: Structured build/feature spec (screens, components, user
+                flow, design, where to implement); rendered for feature/build videos.
             task: The resolved action task block (what to do with the evidence).
                 Defaults to the built-in ``fix`` task when not provided.
 
@@ -174,7 +226,11 @@ class FixPrompts:
         request_block = (
             user_request.strip()
             if user_request and user_request.strip()
-            else "(none provided — treat the recording as a bug report and fix it)"
+            else (
+                "(none provided — analyze what the video shows and act on it: "
+                "if it's a bug, fix it; if it's a feature/demo/walkthrough, "
+                "implement or extend it; otherwise document it)"
+            )
         )
 
         quality = quality or {}
@@ -196,6 +252,8 @@ class FixPrompts:
             confidence_block = "HIGH — the full pipeline ran; act on the evidence below."
         if warnings:
             confidence_block += "\nMissing/uncertain:\n" + "\n".join(f"  - {w}" for w in warnings)
+
+        build_block = FixPrompts._format_build_context(build_context)
 
         prompt = f"""You are an expert engineer working in the user's repository. The \
 user recorded a screen video and asked you to act on it. Carry out the user's request \
@@ -235,7 +293,7 @@ Environment: {env_str}
 
 ## Candidate code locations (ranked by grounding):
 {candidates_str if candidates_str else "  (none found)"}
-
+{build_block}
 ## Visual evidence:
 Key frame: {keyframe_path or "(attached separately)"}
 </evidence>
@@ -244,3 +302,72 @@ Key frame: {keyframe_path or "(attached separately)"}
 
 {ACTION_FOOTER}"""
         return prompt
+
+    @staticmethod
+    def _format_build_context(build_context: dict[str, Any] | None) -> str:
+        """Render the build/feature spec block, or empty string for bug reports.
+
+        Gives an implement/design agent a buildable spec: the screens, the
+        components per screen, the user flow between them, the design notes, and
+        exactly where to implement (existing files to extend, or net-new hints).
+        """
+        if not build_context:
+            return ""
+        bc = build_context
+        lines: list[str] = ["", "## Build context (what to build):"]
+        lines += _fmt_screens(bc.get("screens") or [])
+        lines += _fmt_components(bc.get("components") or [])
+        lines += _fmt_flow(bc.get("user_flow") or [])
+        lines += _fmt_simple_list("Design notes:", bc.get("design_notes") or [], limit=8)
+        lines += _fmt_simple_list("Data shown:", bc.get("data_models") or [], limit=8)
+        targets = bc.get("target_locations") or []
+        if targets:
+            greenfield = " (net-new)" if bc.get("is_greenfield") else ""
+            lines.append(f"Where to implement{greenfield}:")
+            lines.extend(f"  - {t}" for t in targets[:6])
+        return "\n".join(lines) + "\n"
+
+
+def _fmt_screens(screens: list[dict[str, Any]]) -> list[str]:
+    """Render the screens section of the build context block."""
+    if not screens:
+        return []
+    out = ["Screens:"]
+    for s in screens:
+        out.append(f"  - {s.get('name', '?')}: {s.get('summary', '')}".rstrip())
+        comps = ", ".join(s.get("components", [])[:8])
+        if comps:
+            out.append(f"      components: {comps}")
+    return out
+
+
+def _fmt_components(components: list[dict[str, Any]]) -> list[str]:
+    """Render the components section of the build context block."""
+    if not components:
+        return []
+    out = ["Components:"]
+    for c in components[:20]:
+        states = f" [{', '.join(c.get('states', []))}]" if c.get("states") else ""
+        out.append(f"  - {c.get('kind', '?')}: {c.get('label', '?')}{states}")
+    return out
+
+
+def _fmt_flow(flow: list[dict[str, Any]]) -> list[str]:
+    """Render the user-flow section of the build context block."""
+    if not flow:
+        return []
+    out = ["User flow:"]
+    for step in flow:
+        via = f" --({step.get('action')})-->" if step.get("action") else " -->"
+        out.append(
+            f"  {step.get('n', '?')}. {step.get('from_screen', '?')}{via} "
+            f"{step.get('to_screen', '?')}"
+        )
+    return out
+
+
+def _fmt_simple_list(title: str, items: list[str], *, limit: int) -> list[str]:
+    """Render a titled bullet list, or nothing when empty."""
+    if not items:
+        return []
+    return [title, *(f"  - {item}" for item in items[:limit])]

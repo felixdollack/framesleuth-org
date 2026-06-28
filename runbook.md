@@ -390,7 +390,7 @@ echo "job_id=$JOB"
 # 2. Poll until the job reports state: done (or failed):
 curl -s http://127.0.0.1:8010/v1/jobs/$JOB | python -m json.tool
 
-# 3. Read the Bug Context Bundle:
+# 3. Read the Context Bundle:
 curl -s http://127.0.0.1:8010/v1/report/$JOB | python -m json.tool
 ```
 
