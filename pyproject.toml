@@ -92,6 +92,7 @@ module = [
     "mcp.*",
     "aiosqlite.*",
     "faster_whisper.*",
+    "playwright.*",
 ]
 ignore_missing_imports = true
 # Treat these as untyped integration boundaries even when they ship (often
