@@ -8,11 +8,18 @@ It covers the whole path: the reference architecture, the plain HTTP integration
 the **async analyze → poll → report** flow), and the agentic loop that hands the result
 to Claude.
 
-> **Local-first & private.** Framesleuth binds loopback and its CORS is scoped to
-> `chrome-extension://` + loopback — it is **not** meant to be exposed to browsers or the
-> public internet directly. In a web app, **your backend is the client**: the browser
-> talks to *your* server, and *your* server talks to Framesleuth. That keeps the analysis
-> on a machine you control and lets you add your own auth.
+> **Local-first & private.** Framesleuth binds loopback (`127.0.0.1`) — it is **not**
+> meant to be exposed on a network or the public internet. Its CORS allowlist is an
+> explicit set of origins (`WEB_ORIGINS`, default: the hosted demo site + local dev)
+> plus `chrome-extension://`, and it answers Chrome's Private Network Access preflight,
+> so a page on an allowed origin running **in your browser, on your machine** can call
+> the loopback API directly. This is what lets the "Try it" widget on framesleuth.com
+> drive your locally-running agent with zero setup — it never makes the agent reachable
+> off your machine.
+>
+> For your **own production web app**, prefer the proxy pattern below (browser → your
+> server → Framesleuth) and narrow `WEB_ORIGINS` to just your origins, so you keep the
+> analysis on a machine you control and add your own auth.
 
 ---
 
@@ -330,9 +337,11 @@ orchestrates and renders.
 
 ## 5. Deployment & security checklist
 
-- **Don't expose Framesleuth to the browser or the internet.** Keep it on loopback (or a
-  private network) and proxy through your backend. CORS is scoped to `chrome-extension://`
-  + loopback by design.
+- **Keep Framesleuth on loopback.** It binds `127.0.0.1` and is not meant to be exposed on
+  a network or the internet. The CORS allowlist (`WEB_ORIGINS`) only controls which
+  browser origins may *read* responses from the local API — it does **not** make the agent
+  network-reachable. For a production web app, narrow `WEB_ORIGINS` to your own origins (or
+  set it empty) and proxy through your backend instead.
 - **Put auth on *your* layer** (the browser→backend hop). Framesleuth assumes a trusted
   local caller.
 - **Redaction is built in** — Framesleuth strips secrets (passwords, tokens, JWTs) from

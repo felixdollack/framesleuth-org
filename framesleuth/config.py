@@ -130,7 +130,20 @@ class Settings(BaseSettings):
 
     # === Security ===
     CHROME_EXTENSION_ORIGIN: str = "chrome-extension://localhost"
+    # Browser origins (besides the extension) allowed to call this API directly —
+    # e.g. the hosted site connecting to your locally-running agent. The deployed
+    # marketing site + local dev are allowed by default so the "Try it" widget
+    # works with zero config; override with a comma-separated WEB_ORIGINS.
+    WEB_ORIGINS: str = (
+        "https://framesleuth.com,https://www.framesleuth.com,"
+        "http://localhost:3000,http://127.0.0.1:3000"
+    )
     REDACT_BEFORE_PROMPTS: bool = True
+
+    @property
+    def web_origins_list(self) -> list[str]:
+        """Parsed, de-blanked list of allowed browser origins."""
+        return [o.strip() for o in self.WEB_ORIGINS.split(",") if o.strip()]
 
     model_config = {
         "env_file": ".env",

@@ -141,17 +141,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:  # noqa: C901
     app = FastAPI(title="Framesleuth API", version="1.0.0", lifespan=lifespan)
     app.state.app_state = state
 
-    # Accept the configured extension origin plus any chrome-extension:// origin
-    # (the extension ID is only known after the unpacked build is loaded). This
-    # stays scoped to extension origins and the loopback bind — it never opens
-    # the API to arbitrary web origins.
+    # Allow the capture extension *and* the explicit web origins (the hosted site
+    # connecting to a locally-running agent, plus local dev). Origins are an exact
+    # allowlist — this never opens the loopback-bound API to arbitrary web origins.
+    #
+    # ``allow_private_network=True`` answers Chrome's Private Network Access
+    # preflight: a page on a *public* HTTPS origin (e.g. https://framesleuth.com)
+    # calling this loopback API gets ``Access-Control-Request-Private-Network: true``
+    # honored with the matching allow header, so the request isn't blocked.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[settings.CHROME_EXTENSION_ORIGIN],
+        allow_origins=[settings.CHROME_EXTENSION_ORIGIN, *settings.web_origins_list],
         allow_origin_regex=r"chrome-extension://[a-p]{32}",
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
+        allow_private_network=True,
     )
 
     @app.get("/v1/healthz")

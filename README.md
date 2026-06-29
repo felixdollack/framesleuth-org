@@ -292,9 +292,11 @@ Apache-2.0
 Bug capture lives outside this repo. Any screen recording works — drive the agent directly
 with your own video file. A browser capture extension can also record a session, collect
 browser sidecars (console errors, failed requests, clicks), and post the video + sidecars
-to this agent's local API. The agent's CORS is already scoped to `chrome-extension://`
-origins and the loopback bind, so an extension works against a locally running backend with
-no extra setup.
+to this agent's local API. CORS is allowlisted (`WEB_ORIGINS`, default: the hosted demo site
++ local dev) plus `chrome-extension://` origins, and the agent answers Chrome's Private
+Network Access preflight — so both a capture extension and the "Try it" widget on
+framesleuth.com work against a locally running backend with no extra setup. The agent stays
+bound to loopback; CORS only controls which browser origins may read its responses.
 
 **Status:** Backend + pipeline + MCP server completed.  
 **Questions?** Open an issue or check [runbook.md](runbook.md) for common questions.

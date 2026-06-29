@@ -403,3 +403,56 @@ def test_healthz_includes_render_availability(tmp_path: Path) -> None:
         for key in ("playwright", "chromium", "ffmpeg", "python", "ready"):
             assert key in render
         assert isinstance(render["ready"], bool)
+
+
+def test_cors_allows_hosted_site_to_reach_local_agent(tmp_path: Path) -> None:
+    """The hosted site origin can preflight the loopback API (CORS + Private Network).
+
+    This is what lets framesleuth.com talk to a locally-running agent: the browser
+    sends a Private Network Access preflight, and the API must echo the origin plus
+    Access-Control-Allow-Private-Network so Chrome doesn't block the real request.
+    """
+    app = create_app(_make_settings(tmp_path))
+    with TestClient(app) as client:
+        resp = client.options(
+            "/v1/healthz",
+            headers={
+                "Origin": "https://framesleuth.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("access-control-allow-origin") == "https://framesleuth.com"
+        assert resp.headers.get("access-control-allow-private-network") == "true"
+
+
+def test_cors_rejects_unknown_web_origin(tmp_path: Path) -> None:
+    """An origin not on the allowlist is never granted access."""
+    app = create_app(_make_settings(tmp_path))
+    with TestClient(app) as client:
+        resp = client.options(
+            "/v1/healthz",
+            headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "GET"},
+        )
+        assert resp.headers.get("access-control-allow-origin") is None
+
+
+def test_web_origins_setting_is_honored(tmp_path: Path) -> None:
+    """A custom WEB_ORIGINS allowlist is respected (and parsed from the CSV string)."""
+    settings = _make_settings(tmp_path)
+    settings.WEB_ORIGINS = "https://example.dev, http://localhost:4000"
+    assert settings.web_origins_list == ["https://example.dev", "http://localhost:4000"]
+    app = create_app(settings)
+    with TestClient(app) as client:
+        ok = client.options(
+            "/v1/healthz",
+            headers={"Origin": "https://example.dev", "Access-Control-Request-Method": "GET"},
+        )
+        assert ok.headers.get("access-control-allow-origin") == "https://example.dev"
+        # framesleuth.com is no longer in the (overridden) allowlist.
+        no = client.options(
+            "/v1/healthz",
+            headers={"Origin": "https://framesleuth.com", "Access-Control-Request-Method": "GET"},
+        )
+        assert no.headers.get("access-control-allow-origin") is None
